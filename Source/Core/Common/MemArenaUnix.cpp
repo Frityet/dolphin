@@ -28,16 +28,34 @@ MemArena::~MemArena() = default;
 
 void MemArena::GrabSHMSegment(size_t size, std::string_view base_name)
 {
-  const std::string file_name = fmt::format("/{}.{}", base_name, getpid());
-  m_shm_fd = shm_open(file_name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
-  if (m_shm_fd == -1)
+  if (const char* shm_dir = std::getenv("SMGPC_DOLPHIN_SHM_DIR"))
   {
-    ERROR_LOG_FMT(MEMMAP, "shm_open failed: {}", strerror(errno));
-    return;
+    std::string file_name = fmt::format("{}/{}.{}.XXXXXX", shm_dir, base_name, getpid());
+    m_shm_fd = mkstemp(file_name.data());
+    if (m_shm_fd == -1)
+    {
+      ERROR_LOG_FMT(MEMMAP, "mkstemp failed: {}", strerror(errno));
+      return;
+    }
+    unlink(file_name.c_str());
   }
-  shm_unlink(file_name.c_str());
+  else
+  {
+    const std::string file_name = fmt::format("/{}.{}", base_name, getpid());
+    m_shm_fd = shm_open(file_name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (m_shm_fd == -1)
+    {
+      ERROR_LOG_FMT(MEMMAP, "shm_open failed: {}", strerror(errno));
+      return;
+    }
+    shm_unlink(file_name.c_str());
+  }
   if (ftruncate(m_shm_fd, size) < 0)
+  {
     ERROR_LOG_FMT(MEMMAP, "Failed to allocate low memory space");
+    close(m_shm_fd);
+    m_shm_fd = -1;
+  }
 }
 
 void MemArena::ReleaseSHMSegment()
@@ -47,6 +65,9 @@ void MemArena::ReleaseSHMSegment()
 
 void* MemArena::CreateView(s64 offset, size_t size)
 {
+  if (m_shm_fd == -1)
+    return nullptr;
+
   void* retval = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, m_shm_fd, offset);
   if (retval == MAP_FAILED)
   {

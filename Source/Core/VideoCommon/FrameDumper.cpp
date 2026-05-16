@@ -3,6 +3,11 @@
 
 #include "VideoCommon/FrameDumper.h"
 
+#include <charconv>
+#include <cstdlib>
+#include <optional>
+#include <string_view>
+
 #include "Common/Assert.h"
 #include "Common/FileUtil.h"
 #include "Common/Image.h"
@@ -19,6 +24,38 @@
 
 // The video encoder needs the image to be a multiple of x samples.
 static constexpr int VIDEO_ENCODER_LCM = 4;
+
+static std::optional<int> GetSMGPCReferenceCaptureFrame()
+{
+  const char* value = std::getenv("SMGPC_DOLPHIN_CAPTURE_FRAME");
+  if (value == nullptr || value[0] == '\0')
+    return std::nullopt;
+
+  const auto text = std::string_view(value);
+  int frame = 0;
+  const auto* begin = text.data();
+  const auto* end = begin + text.size();
+  const auto result = std::from_chars(begin, end, frame);
+  if (result.ec != std::errc{} || result.ptr != end || frame < 0)
+    return std::nullopt;
+
+  return frame;
+}
+
+static std::optional<std::string> GetSMGPCReferenceCapturePath()
+{
+  const char* value = std::getenv("SMGPC_DOLPHIN_CAPTURE_PATH");
+  if (value == nullptr || value[0] == '\0')
+    return std::nullopt;
+
+  return std::string(value);
+}
+
+static bool HasPendingSMGPCReferenceCapture(bool completed)
+{
+  return !completed && GetSMGPCReferenceCaptureFrame().has_value() &&
+         GetSMGPCReferenceCapturePath().has_value();
+}
 
 static bool DumpFrameToPNG(const FrameData& frame, const std::string& file_name)
 {
@@ -221,6 +258,19 @@ void FrameDumper::FrameDumpThreadFunc()
 
     auto frame = m_frame_dump_data;
 
+    if (!m_smgpc_reference_capture_completed.load())
+    {
+      const auto target_frame = GetSMGPCReferenceCaptureFrame();
+      const auto target_path = GetSMGPCReferenceCapturePath();
+      if (target_frame.has_value() && target_path.has_value() &&
+          frame.state.frame_number >= *target_frame)
+      {
+        if (DumpFrameToPNG(frame, *target_path))
+          OSD::AddMessage("SMGPC reference screenshot saved to " + *target_path);
+        m_smgpc_reference_capture_completed.store(true);
+      }
+    }
+
     // Save screenshot
     if (m_screenshot_request.TestAndClear())
     {
@@ -351,6 +401,9 @@ bool FrameDumper::IsFrameDumping() const
     return true;
 
   if (Config::Get(Config::MAIN_MOVIE_DUMP_FRAMES))
+    return true;
+
+  if (HasPendingSMGPCReferenceCapture(m_smgpc_reference_capture_completed.load()))
     return true;
 
   return false;

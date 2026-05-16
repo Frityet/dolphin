@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "Common/CommonTypes.h"
 #include "Common/Event.h"
 #include "Common/Flag.h"
@@ -98,6 +100,8 @@ private:
   Common::Event m_screenshot_completed;
   std::mutex m_screenshot_lock;
   std::string m_screenshot_name;
+
+  std::atomic_bool m_smgpc_reference_capture_completed{false};
 
   Common::EventHook m_frame_end_handle;
 };

@@ -94,18 +94,27 @@ WiimoteScannerHidapi::WiimoteScannerHidapi()
 #define hid_init hidapi_hid_init
 #endif
   int ret = hid_init();
-  ASSERT_MSG(WIIMOTE, ret == 0, "Couldn't initialise hidapi.");
+  if (ret == 0)
+  {
+    m_initialized = true;
+  }
+  else
+  {
+    ERROR_LOG_FMT(WIIMOTE, "Couldn't initialise hidapi. Real Wii Remote HID scanning is disabled.");
+  }
 }
 
 WiimoteScannerHidapi::~WiimoteScannerHidapi()
 {
-  if (hid_exit() == -1)
+  if (m_initialized && hid_exit() == -1)
     ERROR_LOG_FMT(WIIMOTE, "Failed to clean up hidapi.");
 }
 
 auto WiimoteScannerHidapi::FindAttachedWiimotes() -> FindResults
 {
   FindResults results;
+  if (!m_initialized)
+    return results;
 
   hid_device_info* list = hid_enumerate(0x0, 0x0);  // FYI: 0 for all VID/PID.
   for (hid_device_info* device = list; device != nullptr; device = device->next)

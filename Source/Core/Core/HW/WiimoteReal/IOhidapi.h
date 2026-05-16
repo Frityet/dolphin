@@ -40,6 +40,9 @@ public:
 
   void Update() override {}                // not needed for hidapi
   void RequestStopSearching() override {}  // not needed for hidapi
+
+private:
+  bool m_initialized = false;
 };
 }  // namespace WiimoteReal
 

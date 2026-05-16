@@ -621,14 +621,14 @@ ReEncodeString(std::basic_string_view<InputCharType> input)
   Decoder decoder{std::span{input}.first(input_size)};
 
   std::basic_string<ResultCharType> result;
-  result.resize_and_overwrite(buffer_size, [&](ResultCharType* buf, std::size_t) {
-    auto* position = buf;
+  result.resize(buffer_size);
 
-    while (decoder.RemainingCodeUnits() != 0)
-      position += encoder(decoder(), position);
+  auto* const buffer = result.data();
+  auto* position = buffer;
+  while (decoder.RemainingCodeUnits() != 0)
+    position += encoder(decoder(), position);
 
-    return position - buf;
-  });
+  result.resize(static_cast<std::size_t>(position - buffer));
 
   return result;
 }

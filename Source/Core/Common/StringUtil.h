@@ -197,19 +197,28 @@ std::optional<std::array<std::string_view, Count>> SplitStringIntoArray(std::str
   std::optional<std::array<std::string_view, Count>> result;
   result.emplace();
 
-  std::size_t index = 0;
-  for (auto&& item : subject | std::views::split(delim))
+  std::size_t start = 0;
+  for (std::size_t index = 0; index < Count; ++index)
   {
-    // Too many delim.
-    if (index == Count)
-      return std::nullopt;
+    const std::size_t next_delim = subject.find(delim, start);
+    if (index == Count - 1)
+    {
+      // Too many delim.
+      if (next_delim != std::string_view::npos)
+        return std::nullopt;
 
-    (*result)[index++] = std::string_view{item};
+      (*result)[index] = subject.substr(start);
+    }
+    else
+    {
+      // Too few delim.
+      if (next_delim == std::string_view::npos)
+        return std::nullopt;
+
+      (*result)[index] = subject.substr(start, next_delim - start);
+      start = next_delim + 1;
+    }
   }
-
-  // Too few delim.
-  if (index != Count)
-    return std::nullopt;
 
   return result;
 }
