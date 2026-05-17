@@ -276,15 +276,6 @@ const char* BoolJson(bool value)
   return value ? "true" : "false";
 }
 
-template <typename T>
-void WriteJsonField(std::ostream& out, std::string_view name, const T& value, bool trailing_comma)
-{
-  out << "      \"" << name << "\": " << value;
-  if (trailing_comma)
-    out << ',';
-  out << '\n';
-}
-
 const char* PrimitiveTypeName(PrimitiveType primitive_type)
 {
   switch (primitive_type)
@@ -394,6 +385,36 @@ void WriteColor4(std::ostream& out, const std::array<u8, 4>& values)
       << static_cast<u32>(values[2]) << ", " << static_cast<u32>(values[3]) << ']';
 }
 
+void WriteJsonString(std::ostream& out, std::string_view value)
+{
+  out << '"';
+  for (const char c : value)
+  {
+    switch (c)
+    {
+    case '\\':
+      out << "\\\\";
+      break;
+    case '"':
+      out << "\\\"";
+      break;
+    case '\n':
+      out << "\\n";
+      break;
+    case '\r':
+      out << "\\r";
+      break;
+    case '\t':
+      out << "\\t";
+      break;
+    default:
+      out << c;
+      break;
+    }
+  }
+  out << '"';
+}
+
 void WriteTextureBinding(const SMGPCDolphinTextureTraceState& texture, std::ostream& out)
 {
   out << "        {\"slot\": " << texture.slot
@@ -425,148 +446,229 @@ void WriteTextureBinding(const SMGPCDolphinTextureTraceState& texture, std::ostr
       << ", \"tex_image2_raw\": " << texture.tex_image2_raw
       << ", \"tex_image3_raw\": " << texture.tex_image3_raw
       << ", \"tex_tlut_raw\": " << texture.tex_tlut_raw
-      << ", \"identity_name\": \"" << texture.identity_name << "\"}";
+      << ", \"identity_name\": ";
+  WriteJsonString(out, texture.identity_name);
+  out << '}';
 }
 
-void WriteSMGPCDolphinDrawTraceEvents(std::ostream& out)
+void WriteSMGPCTraceRecordPrefix(std::ostream& out, std::string_view record_type, int requested_frame)
 {
-  out << "  \"render_packets\": [\n";
+  out << "{\"schema\":\"smgpc-trace-ndjson-v1\",\"record_type\":";
+  WriteJsonString(out, record_type);
+  out << ",\"emulator\":\"dolphin\",\"frame_index\":" << requested_frame;
+}
+
+void WriteSMGPCDolphinDrawTraceEventPayload(std::ostream& out,
+                                            const SMGPCDolphinDrawTraceEvent& event,
+                                            std::size_t event_index)
+{
+  const auto tev_stage_count = std::min<std::size_t>(event.tev_stage_count, 16);
+  const auto color_channel_count = std::min<std::size_t>(event.color_channel_count, 2);
+
+  out << "{\"index\": " << event_index
+      << ", \"draw_index\": " << event.draw_index
+      << ", \"presenter_frame_count\": " << event.presenter_frame_count
+      << ", \"frame_index\": " << event.presenter_frame_count
+      << ", \"model_name\": null"
+      << ", \"material_name\": null"
+      << ", \"render_pass\": \"GXDraw\""
+      << ", \"view_id\": 0"
+      << ", \"primitive_type\": ";
+  WriteJsonString(out, PrimitiveTypeName(event.primitive_type));
+  out << ", \"primitive_type_raw\": " << static_cast<u32>(event.primitive_type)
+      << ", \"num_vertices\": " << event.num_vertices
+      << ", \"num_indices\": " << event.num_indices
+      << ", \"base_vertex\": " << event.base_vertex
+      << ", \"base_index\": " << event.base_index
+      << ", \"used_textures_mask\": " << event.used_textures_mask
+      << ", \"used_texture_slots\": [";
+  WriteUsedTextureSlots(out, event.used_textures_mask);
+  out << "], \"texture_bindings\": [";
+  bool needs_texture_comma = false;
+  for (const auto& texture : event.textures)
+  {
+    if (!texture.active)
+      continue;
+
+    if (needs_texture_comma)
+      out << ", ";
+    WriteTextureBinding(texture, out);
+    needs_texture_comma = true;
+  }
+  out << "]"
+      << ", \"gen_mode\": {\"raw\": " << event.gen_mode_raw
+      << ", \"texgen_count\": " << event.texgen_count
+      << ", \"color_channel_count\": " << event.color_channel_count
+      << ", \"tev_stage_count\": " << event.tev_stage_count
+      << ", \"indirect_stage_count\": " << event.indirect_stage_count
+      << ", \"cull_mode\": " << event.cull_mode << "}"
+      << ", \"gx_z_mode\": {\"raw\": " << event.z_mode_raw
+      << ", \"compare_enable\": " << BoolJson(event.z_compare_enable)
+      << ", \"function\": " << event.z_function
+      << ", \"update_enable\": " << BoolJson(event.z_update_enable) << "}"
+      << ", \"gx_blend\": {\"raw\": " << event.blend_mode_raw
+      << ", \"enabled\": " << BoolJson(event.blend_enable)
+      << ", \"logic_op_enable\": " << BoolJson(event.logic_op_enable)
+      << ", \"color_update\": " << BoolJson(event.color_update)
+      << ", \"alpha_update\": " << BoolJson(event.alpha_update)
+      << ", \"src_factor\": " << event.src_blend_factor
+      << ", \"dst_factor\": " << event.dst_blend_factor << "}"
+      << ", \"gx_alpha_compare\": {\"raw\": " << event.alpha_compare_raw
+      << ", \"comp0\": " << event.alpha_comp0
+      << ", \"ref0\": " << event.alpha_ref0
+      << ", \"op\": " << event.alpha_op
+      << ", \"comp1\": " << event.alpha_comp1
+      << ", \"ref1\": " << event.alpha_ref1 << "}"
+      << ", \"gx_fog\": {\"a_raw\": " << event.fog_raw[0]
+      << ", \"b_magnitude\": " << event.fog_raw[1]
+      << ", \"b_shift\": " << event.fog_raw[2]
+      << ", \"c_proj_fsel_raw\": " << event.fog_raw[3]
+      << ", \"color_raw\": " << event.fog_raw[4] << "}"
+      << ", \"tev_orders\": [";
+  for (std::size_t stage = 0; stage < tev_stage_count; ++stage)
+  {
+    const auto& order = event.tev_orders[stage];
+    if (stage != 0)
+      out << ", ";
+    out << "{\"stage\": " << order.stage
+        << ", \"texture_enabled\": " << BoolJson(order.texture_enabled)
+        << ", \"tex_coord\": " << order.tex_coord
+        << ", \"tex_map\": " << order.tex_map
+        << ", \"color_channel\": " << order.color_channel << "}";
+  }
+  out << "], \"tev_stages\": [";
+  for (std::size_t stage = 0; stage < tev_stage_count; ++stage)
+  {
+    const auto& tev_stage = event.tev_stages[stage];
+    if (stage != 0)
+      out << ", ";
+    out << "{\"stage\": " << tev_stage.stage
+        << ", \"color_raw\": " << tev_stage.color_raw
+        << ", \"alpha_raw\": " << tev_stage.alpha_raw << "}";
+  }
+  out << "], \"color_channels\": [";
+  for (std::size_t channel = 0; channel < color_channel_count; ++channel)
+  {
+    const auto& color_channel = event.color_channels[channel];
+    if (channel != 0)
+      out << ", ";
+    out << "{\"channel\": " << color_channel.channel
+        << ", \"color_raw\": " << color_channel.color_raw
+        << ", \"alpha_raw\": " << color_channel.alpha_raw
+        << ", \"color_light_mask\": " << color_channel.color_light_mask
+        << ", \"alpha_light_mask\": " << color_channel.alpha_light_mask << "}";
+  }
+  out << "], \"requested_light_mask\": " << event.requested_light_mask
+      << ", \"loaded_light_mask\": " << event.loaded_light_mask
+      << ", \"lights\": [";
+  bool needs_light_comma = false;
+  for (const auto& light : event.lights)
+  {
+    if (!light.active)
+      continue;
+
+    if (needs_light_comma)
+      out << ", ";
+    out << "{\"index\": " << light.index << ", \"color\": ";
+    WriteColor4(out, light.color_rgba);
+    out << ", \"color_abgr\": ";
+    WriteColor4(out, light.color_abgr);
+    out << ", \"cosine_attenuation\": ";
+    WriteFloat3(out, light.cosine_attenuation);
+    out << ", \"distance_attenuation\": ";
+    WriteFloat3(out, light.distance_attenuation);
+    out << ", \"position\": ";
+    WriteFloat3(out, light.position);
+    out << ", \"direction\": ";
+    WriteFloat3(out, light.direction);
+    out << "}";
+    needs_light_comma = true;
+  }
+  out << "]}";
+}
+
+void WriteSMGPCDolphinDrawTraceRecords(std::ostream& out, int requested_frame)
+{
   for (std::size_t i = 0; i < s_smgpc_dolphin_draw_trace_events.size(); ++i)
   {
     const auto& event = s_smgpc_dolphin_draw_trace_events[i];
-    const auto tev_stage_count = std::min<std::size_t>(event.tev_stage_count, 16);
-    const auto color_channel_count = std::min<std::size_t>(event.color_channel_count, 2);
-
-    out << "    {\n";
-    WriteJsonField(out, "index", i, true);
-    WriteJsonField(out, "draw_index", event.draw_index, true);
-    WriteJsonField(out, "presenter_frame_count", event.presenter_frame_count, true);
-    WriteJsonField(out, "frame_index", event.presenter_frame_count, true);
-    out << "      \"model_name\": null,\n";
-    out << "      \"material_name\": null,\n";
-    out << "      \"render_pass\": \"GXDraw\",\n";
-    WriteJsonField(out, "view_id", 0, true);
-    out << "      \"primitive_type\": \"" << PrimitiveTypeName(event.primitive_type) << "\",\n";
-    WriteJsonField(out, "primitive_type_raw", static_cast<u32>(event.primitive_type), true);
-    WriteJsonField(out, "num_vertices", event.num_vertices, true);
-    WriteJsonField(out, "num_indices", event.num_indices, true);
-    WriteJsonField(out, "base_vertex", event.base_vertex, true);
-    WriteJsonField(out, "base_index", event.base_index, true);
-    WriteJsonField(out, "used_textures_mask", event.used_textures_mask, true);
-    out << "      \"used_texture_slots\": [";
-    WriteUsedTextureSlots(out, event.used_textures_mask);
-    out << "],\n";
-    out << "      \"texture_bindings\": [\n";
-    bool needs_texture_comma = false;
-    for (const auto& texture : event.textures)
-    {
-      if (!texture.active)
-        continue;
-
-      if (needs_texture_comma)
-        out << ",\n";
-      WriteTextureBinding(texture, out);
-      needs_texture_comma = true;
-    }
-    out << '\n';
-    out << "      ],\n";
-    out << "      \"gen_mode\": {\"raw\": " << event.gen_mode_raw
-        << ", \"texgen_count\": " << event.texgen_count
-        << ", \"color_channel_count\": " << event.color_channel_count
-        << ", \"tev_stage_count\": " << event.tev_stage_count
-        << ", \"indirect_stage_count\": " << event.indirect_stage_count
-        << ", \"cull_mode\": " << event.cull_mode << "},\n";
-    out << "      \"gx_z_mode\": {\"raw\": " << event.z_mode_raw
-        << ", \"compare_enable\": " << BoolJson(event.z_compare_enable)
-        << ", \"function\": " << event.z_function
-        << ", \"update_enable\": " << BoolJson(event.z_update_enable) << "},\n";
-    out << "      \"gx_blend\": {\"raw\": " << event.blend_mode_raw
-        << ", \"enabled\": " << BoolJson(event.blend_enable)
-        << ", \"logic_op_enable\": " << BoolJson(event.logic_op_enable)
-        << ", \"color_update\": " << BoolJson(event.color_update)
-        << ", \"alpha_update\": " << BoolJson(event.alpha_update)
-        << ", \"src_factor\": " << event.src_blend_factor
-        << ", \"dst_factor\": " << event.dst_blend_factor << "},\n";
-    out << "      \"gx_alpha_compare\": {\"raw\": " << event.alpha_compare_raw
-        << ", \"comp0\": " << event.alpha_comp0 << ", \"ref0\": " << event.alpha_ref0
-        << ", \"op\": " << event.alpha_op << ", \"comp1\": " << event.alpha_comp1
-        << ", \"ref1\": " << event.alpha_ref1 << "},\n";
-    out << "      \"gx_fog\": {\"a_raw\": " << event.fog_raw[0]
-        << ", \"b_magnitude\": " << event.fog_raw[1] << ", \"b_shift\": " << event.fog_raw[2]
-        << ", \"c_proj_fsel_raw\": " << event.fog_raw[3] << ", \"color_raw\": " << event.fog_raw[4]
-        << "},\n";
-    out << "      \"tev_orders\": [\n";
-    for (std::size_t stage = 0; stage < tev_stage_count; ++stage)
-    {
-      const auto& order = event.tev_orders[stage];
-      out << "        {\"stage\": " << order.stage
-          << ", \"texture_enabled\": " << BoolJson(order.texture_enabled)
-          << ", \"tex_coord\": " << order.tex_coord << ", \"tex_map\": " << order.tex_map
-          << ", \"color_channel\": " << order.color_channel << "}";
-      if (stage + 1U < tev_stage_count)
-        out << ',';
-      out << '\n';
-    }
-    out << "      ],\n";
-    out << "      \"tev_stages\": [\n";
-    for (std::size_t stage = 0; stage < tev_stage_count; ++stage)
-    {
-      const auto& tev_stage = event.tev_stages[stage];
-      out << "        {\"stage\": " << tev_stage.stage << ", \"color_raw\": " << tev_stage.color_raw
-          << ", \"alpha_raw\": " << tev_stage.alpha_raw << "}";
-      if (stage + 1U < tev_stage_count)
-        out << ',';
-      out << '\n';
-    }
-    out << "      ],\n";
-    out << "      \"color_channels\": [\n";
-    for (std::size_t channel = 0; channel < color_channel_count; ++channel)
-    {
-      const auto& color_channel = event.color_channels[channel];
-      out << "        {\"channel\": " << color_channel.channel
-          << ", \"color_raw\": " << color_channel.color_raw
-          << ", \"alpha_raw\": " << color_channel.alpha_raw
-          << ", \"color_light_mask\": " << color_channel.color_light_mask
-          << ", \"alpha_light_mask\": " << color_channel.alpha_light_mask << "}";
-      if (channel + 1U < color_channel_count)
-        out << ',';
-      out << '\n';
-    }
-    out << "      ],\n";
-    WriteJsonField(out, "requested_light_mask", event.requested_light_mask, true);
-    WriteJsonField(out, "loaded_light_mask", event.loaded_light_mask, true);
-    out << "      \"lights\": [\n";
-    bool needs_light_comma = false;
-    for (const auto& light : event.lights)
-    {
-      if (!light.active)
-        continue;
-
-      if (needs_light_comma)
-        out << ",\n";
-      out << "        {\"index\": " << light.index << ", \"color\": ";
-      WriteColor4(out, light.color_rgba);
-      out << ", \"color_abgr\": ";
-      WriteColor4(out, light.color_abgr);
-      out << ", \"cosine_attenuation\": ";
-      WriteFloat3(out, light.cosine_attenuation);
-      out << ", \"distance_attenuation\": ";
-      WriteFloat3(out, light.distance_attenuation);
-      out << ", \"position\": ";
-      WriteFloat3(out, light.position);
-      out << ", \"direction\": ";
-      WriteFloat3(out, light.direction);
-      out << "}";
-      needs_light_comma = true;
-    }
-    out << '\n';
-    out << "      ]\n";
-    out << "    }";
-    if (i + 1U < s_smgpc_dolphin_draw_trace_events.size())
-      out << ',';
-    out << '\n';
+    WriteSMGPCTraceRecordPrefix(out, "render_packet", requested_frame);
+    out << ",\"record_index\":" << i << ",\"payload\":";
+    WriteSMGPCDolphinDrawTraceEventPayload(out, event, i);
+    out << "}\n";
   }
-  out << "  ],\n";
+}
+
+void WriteSMGPCDolphinTopLevelRecord(std::ostream& out, int requested_frame, std::string_view key,
+                                     std::string_view payload_json)
+{
+  WriteSMGPCTraceRecordPrefix(out, "top_level", requested_frame);
+  out << ",\"key\":";
+  WriteJsonString(out, key);
+  out << ",\"payload\":" << payload_json << "}\n";
+}
+
+void WriteSMGPCDolphinCopyEventPayload(std::ostream& out,
+                                       const SMGPCDolphinCopyTraceEvent& event,
+                                       std::size_t event_index)
+{
+  out << "{\"index\": " << event_index
+      << ", \"event_index\": " << event.event_index
+      << ", \"presenter_frame_count\": " << event.presenter_frame_count
+      << ", \"kind\": \"" << (event.copy_to_xfb ? "xfb" : "texture") << "\""
+      << ", \"copy_to_xfb\": " << BoolJson(event.copy_to_xfb)
+      << ", \"depth_copy\": " << BoolJson(event.depth_copy)
+      << ", \"clear\": " << BoolJson(event.clear)
+      << ", \"half_scale\": " << BoolJson(event.half_scale)
+      << ", \"scale_invert\": " << BoolJson(event.scale_invert)
+      << ", \"clamp_top\": " << BoolJson(event.clamp_top)
+      << ", \"clamp_bottom\": " << BoolJson(event.clamp_bottom)
+      << ", \"intensity_format\": " << BoolJson(event.intensity_format)
+      << ", \"auto_conversion\": " << BoolJson(event.auto_conversion)
+      << ", \"dest_addr\": " << event.dest_addr
+      << ", \"dest_stride\": " << event.dest_stride
+      << ", \"source_rect\": {\"left\": " << event.src_left
+      << ", \"top\": " << event.src_top
+      << ", \"right\": " << event.src_right
+      << ", \"bottom\": " << event.src_bottom
+      << ", \"width\": " << event.copy_width
+      << ", \"height\": " << event.copy_height << "}"
+      << ", \"output_size\": {\"width\": " << event.output_width
+      << ", \"height\": " << event.output_height << "}"
+      << ", \"target_pixel_format\": " << event.target_pixel_format
+      << ", \"real_format\": " << event.real_format
+      << ", \"frame_to_field\": " << event.frame_to_field
+      << ", \"gamma_index\": " << event.gamma_index
+      << ", \"gamma_value\": " << event.gamma_value
+      << ", \"y_scale\": " << event.y_scale
+      << ", \"dispcopyyscale\": " << event.dispcopyyscale
+      << ", \"scissor\": {\"tl_raw\": " << event.scissor_tl_raw
+      << ", \"br_raw\": " << event.scissor_br_raw
+      << ", \"offset_raw\": " << event.scissor_offset_raw << "}"
+      << ", \"viewport\": {\"left\": " << event.viewport_left
+      << ", \"right\": " << event.viewport_right
+      << ", \"top\": " << event.viewport_top
+      << ", \"bottom\": " << event.viewport_bottom
+      << ", \"near_depth\": " << event.viewport_near_depth
+      << ", \"far_depth\": " << event.viewport_far_depth << "}"
+      << ", \"backbuffer\": {\"width\": " << event.backbuffer_width
+      << ", \"height\": " << event.backbuffer_height << "}"
+      << ", \"target_rect\": {\"left\": " << event.target_left
+      << ", \"top\": " << event.target_top
+      << ", \"right\": " << event.target_right
+      << ", \"bottom\": " << event.target_bottom << "}}";
+}
+
+void WriteSMGPCDolphinCopyTraceRecords(std::ostream& out, int requested_frame)
+{
+  for (std::size_t i = 0; i < s_smgpc_dolphin_copy_trace_events.size(); ++i)
+  {
+    const auto& event = s_smgpc_dolphin_copy_trace_events[i];
+    WriteSMGPCTraceRecordPrefix(out, "copy_event", requested_frame);
+    out << ",\"record_index\":" << i << ",\"payload\":";
+    WriteSMGPCDolphinCopyEventPayload(out, event, i);
+    out << "}\n";
+  }
 }
 
 void WriteSMGPCDolphinCopyTrace(const std::string& path, int requested_frame, int window)
@@ -579,76 +681,20 @@ void WriteSMGPCDolphinCopyTrace(const std::string& path, int requested_frame, in
     return;
 
   const auto current_frame = g_presenter ? g_presenter->FrameCount() : 0;
-  out << "{\n";
-  out << "  \"schema\": \"smgpc-dolphin-parity-trace-v1\",\n";
-  out << "  \"emulator\": \"dolphin\",\n";
-  out << "  \"requested_frame\": " << requested_frame << ",\n";
-  out << "  \"trace_window\": " << window << ",\n";
-  out << "  \"frame\": {\n";
-  out << "    \"index\": " << requested_frame << ",\n";
-  out << "    \"dolphin_presenter_frame_count\": " << current_frame << ",\n";
-  out << "    \"framebuffer\": {\n";
-  out << "      \"width\": " << (g_presenter ? g_presenter->GetBackbufferWidth() : 0) << ",\n";
-  out << "      \"height\": " << (g_presenter ? g_presenter->GetBackbufferHeight() : 0) << "\n";
-  out << "    }\n";
-  out << "  },\n";
-  out << "  \"camera_pose\": null,\n";
-  out << "  \"scene_snapshot\": [],\n";
-  out << "  \"scene_trace\": [],\n";
-  out << "  \"layout_runtime\": [],\n";
-  WriteSMGPCDolphinDrawTraceEvents(out);
-  out << "  \"copy_events\": [\n";
-  for (std::size_t i = 0; i < s_smgpc_dolphin_copy_trace_events.size(); ++i)
-  {
-    const auto& event = s_smgpc_dolphin_copy_trace_events[i];
-    out << "    {\n";
-    WriteJsonField(out, "index", i, true);
-    WriteJsonField(out, "event_index", event.event_index, true);
-    WriteJsonField(out, "presenter_frame_count", event.presenter_frame_count, true);
-    out << "      \"kind\": \"" << (event.copy_to_xfb ? "xfb" : "texture") << "\",\n";
-    WriteJsonField(out, "copy_to_xfb", BoolJson(event.copy_to_xfb), true);
-    WriteJsonField(out, "depth_copy", BoolJson(event.depth_copy), true);
-    WriteJsonField(out, "clear", BoolJson(event.clear), true);
-    WriteJsonField(out, "half_scale", BoolJson(event.half_scale), true);
-    WriteJsonField(out, "scale_invert", BoolJson(event.scale_invert), true);
-    WriteJsonField(out, "clamp_top", BoolJson(event.clamp_top), true);
-    WriteJsonField(out, "clamp_bottom", BoolJson(event.clamp_bottom), true);
-    WriteJsonField(out, "intensity_format", BoolJson(event.intensity_format), true);
-    WriteJsonField(out, "auto_conversion", BoolJson(event.auto_conversion), true);
-    WriteJsonField(out, "dest_addr", event.dest_addr, true);
-    WriteJsonField(out, "dest_stride", event.dest_stride, true);
-    out << "      \"source_rect\": {\"left\": " << event.src_left << ", \"top\": " << event.src_top
-        << ", \"right\": " << event.src_right << ", \"bottom\": " << event.src_bottom
-        << ", \"width\": " << event.copy_width << ", \"height\": " << event.copy_height << "},\n";
-    out << "      \"output_size\": {\"width\": " << event.output_width
-        << ", \"height\": " << event.output_height << "},\n";
-    WriteJsonField(out, "target_pixel_format", event.target_pixel_format, true);
-    WriteJsonField(out, "real_format", event.real_format, true);
-    WriteJsonField(out, "frame_to_field", event.frame_to_field, true);
-    WriteJsonField(out, "gamma_index", event.gamma_index, true);
-    WriteJsonField(out, "gamma_value", event.gamma_value, true);
-    WriteJsonField(out, "y_scale", event.y_scale, true);
-    WriteJsonField(out, "dispcopyyscale", event.dispcopyyscale, true);
-    out << "      \"scissor\": {\"tl_raw\": " << event.scissor_tl_raw
-        << ", \"br_raw\": " << event.scissor_br_raw
-        << ", \"offset_raw\": " << event.scissor_offset_raw << "},\n";
-    out << "      \"viewport\": {\"left\": " << event.viewport_left
-        << ", \"right\": " << event.viewport_right << ", \"top\": " << event.viewport_top
-        << ", \"bottom\": " << event.viewport_bottom
-        << ", \"near_depth\": " << event.viewport_near_depth
-        << ", \"far_depth\": " << event.viewport_far_depth << "},\n";
-    out << "      \"backbuffer\": {\"width\": " << event.backbuffer_width
-        << ", \"height\": " << event.backbuffer_height << "},\n";
-    out << "      \"target_rect\": {\"left\": " << event.target_left
-        << ", \"top\": " << event.target_top << ", \"right\": " << event.target_right
-        << ", \"bottom\": " << event.target_bottom << "}\n";
-    out << "    }";
-    if (i + 1U < s_smgpc_dolphin_copy_trace_events.size())
-      out << ',';
-    out << '\n';
-  }
-  out << "  ]\n";
-  out << "}\n";
+  WriteSMGPCTraceRecordPrefix(out, "trace_meta", requested_frame);
+  out << ",\"payload\":{\"source_schema\":\"smgpc-dolphin-parity-trace-v1\",\"emulator\":\"dolphin\",\"requested_frame\":"
+      << requested_frame << ",\"trace_window\":" << window << "}}\n";
+  WriteSMGPCTraceRecordPrefix(out, "frame", requested_frame);
+  out << ",\"payload\":{\"index\":" << requested_frame
+      << ",\"dolphin_presenter_frame_count\":" << current_frame
+      << ",\"framebuffer\":{\"width\":" << (g_presenter ? g_presenter->GetBackbufferWidth() : 0)
+      << ",\"height\":" << (g_presenter ? g_presenter->GetBackbufferHeight() : 0) << "}}}\n";
+  WriteSMGPCDolphinTopLevelRecord(out, requested_frame, "camera_pose", "null");
+  WriteSMGPCDolphinTopLevelRecord(out, requested_frame, "scene_snapshot", "[]");
+  WriteSMGPCDolphinTopLevelRecord(out, requested_frame, "scene_trace", "[]");
+  WriteSMGPCDolphinTopLevelRecord(out, requested_frame, "layout_runtime", "[]");
+  WriteSMGPCDolphinDrawTraceRecords(out, requested_frame);
+  WriteSMGPCDolphinCopyTraceRecords(out, requested_frame);
 }
 
 void RecordSMGPCDolphinCopyTrace(bool copy_to_xfb, const MathUtil::Rectangle<s32>& src_rect,
