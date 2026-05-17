@@ -271,6 +271,33 @@ std::optional<std::string> GetSMGPCDolphinTracePath()
   return std::string(value);
 }
 
+std::optional<std::string> GetSMGPCDolphinSemanticAnchorName()
+{
+  const char* value = std::getenv("SMGPC_DOLPHIN_SEMANTIC_ANCHOR_NAME");
+  if (value == nullptr || value[0] == '\0')
+    return std::nullopt;
+
+  return std::string(value);
+}
+
+std::string GetSMGPCDolphinSemanticAnchorCategory()
+{
+  const char* value = std::getenv("SMGPC_DOLPHIN_SEMANTIC_ANCHOR_CATEGORY");
+  if (value == nullptr || value[0] == '\0')
+    return "capture";
+
+  return std::string(value);
+}
+
+std::string GetSMGPCDolphinSemanticAnchorDetail(int requested_frame)
+{
+  const char* value = std::getenv("SMGPC_DOLPHIN_SEMANTIC_ANCHOR_DETAIL");
+  if (value != nullptr && value[0] != '\0')
+    return std::string(value);
+
+  return "requested_frame=" + std::to_string(requested_frame);
+}
+
 const char* BoolJson(bool value)
 {
   return value ? "true" : "false";
@@ -608,6 +635,42 @@ void WriteSMGPCDolphinTopLevelRecord(std::ostream& out, int requested_frame, std
   out << ",\"payload\":" << payload_json << "}\n";
 }
 
+void WriteSMGPCDolphinSemanticEventRecord(std::ostream& out, int requested_frame,
+                                          std::size_t record_index, std::string_view category,
+                                          std::string_view name, std::string_view detail,
+                                          std::string_view source)
+{
+  WriteSMGPCTraceRecordPrefix(out, "semantic_event", requested_frame);
+  out << ",\"record_index\":" << record_index << ",\"payload\":{\"index\":" << record_index
+      << ",\"frame_index\":" << requested_frame << ",\"category\":";
+  WriteJsonString(out, category);
+  out << ",\"name\":";
+  WriteJsonString(out, name);
+  out << ",\"detail\":";
+  WriteJsonString(out, detail);
+  out << ",\"stage\":\"\",\"source\":";
+  WriteJsonString(out, source);
+  out << "}}\n";
+}
+
+void WriteSMGPCDolphinSemanticTraceRecords(std::ostream& out, int requested_frame)
+{
+  auto record_index = std::size_t{0};
+  WriteSMGPCDolphinSemanticEventRecord(out, requested_frame, record_index++, "capture",
+                                       "dolphin_trace_requested_frame",
+                                       "requested_frame=" + std::to_string(requested_frame),
+                                       "dolphin_trace");
+
+  const auto anchor_name = GetSMGPCDolphinSemanticAnchorName();
+  if (!anchor_name.has_value())
+    return;
+
+  WriteSMGPCDolphinSemanticEventRecord(out, requested_frame, record_index++,
+                                       GetSMGPCDolphinSemanticAnchorCategory(), *anchor_name,
+                                       GetSMGPCDolphinSemanticAnchorDetail(requested_frame),
+                                       "parity_capture");
+}
+
 void WriteSMGPCDolphinCopyEventPayload(std::ostream& out,
                                        const SMGPCDolphinCopyTraceEvent& event,
                                        std::size_t event_index)
@@ -693,6 +756,7 @@ void WriteSMGPCDolphinCopyTrace(const std::string& path, int requested_frame, in
   WriteSMGPCDolphinTopLevelRecord(out, requested_frame, "scene_snapshot", "[]");
   WriteSMGPCDolphinTopLevelRecord(out, requested_frame, "scene_trace", "[]");
   WriteSMGPCDolphinTopLevelRecord(out, requested_frame, "layout_runtime", "[]");
+  WriteSMGPCDolphinSemanticTraceRecords(out, requested_frame);
   WriteSMGPCDolphinDrawTraceRecords(out, requested_frame);
   WriteSMGPCDolphinCopyTraceRecords(out, requested_frame);
 }
