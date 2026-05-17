@@ -4,13 +4,24 @@
 #include "VideoCommon/BPStructs.h"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
+#include <vector>
 
 #include <fmt/format.h>
 
 #include "Common/CommonTypes.h"
 #include "Common/EnumMap.h"
+#include "Common/FileUtil.h"
 #include "Common/Logging/Log.h"
 
 #include "Core/DolphinAnalytics.h"
@@ -31,10 +42,12 @@
 #include "VideoCommon/PixelEngine.h"
 #include "VideoCommon/PixelShaderManager.h"
 #include "VideoCommon/Present.h"
+#include "VideoCommon/SMGPCParityTrace.h"
 #include "VideoCommon/Statistics.h"
 #include "VideoCommon/TMEM.h"
 #include "VideoCommon/TextureCacheBase.h"
 #include "VideoCommon/TextureDecoder.h"
+#include "VideoCommon/TextureInfo.h"
 #include "VideoCommon/VideoBackendBase.h"
 #include "VideoCommon/VideoCommon.h"
 #include "VideoCommon/VideoConfig.h"
@@ -45,6 +58,843 @@ using namespace BPFunctions;
 
 static constexpr Common::EnumMap<float, GammaCorrection::Invalid2_2> s_gammaLUT = {1.0f, 1.7f, 2.2f,
                                                                                    2.2f};
+
+namespace
+{
+struct SMGPCDolphinCopyTraceEvent
+{
+  u64 event_index = 0;
+  int presenter_frame_count = 0;
+  bool copy_to_xfb = false;
+  bool depth_copy = false;
+  bool clear = false;
+  bool half_scale = false;
+  bool scale_invert = false;
+  bool clamp_top = false;
+  bool clamp_bottom = false;
+  bool intensity_format = false;
+  bool auto_conversion = false;
+  u32 dest_addr = 0;
+  u32 dest_stride = 0;
+  u32 src_left = 0;
+  u32 src_top = 0;
+  u32 src_right = 0;
+  u32 src_bottom = 0;
+  u32 copy_width = 0;
+  u32 copy_height = 0;
+  u32 output_width = 0;
+  u32 output_height = 0;
+  u32 target_pixel_format = 0;
+  u32 real_format = 0;
+  u32 frame_to_field = 0;
+  u32 gamma_index = 0;
+  float gamma_value = 1.0f;
+  float y_scale = 1.0f;
+  u32 dispcopyyscale = 0;
+  u32 scissor_tl_raw = 0;
+  u32 scissor_br_raw = 0;
+  u32 scissor_offset_raw = 0;
+  float viewport_left = 0.0f;
+  float viewport_right = 0.0f;
+  float viewport_top = 0.0f;
+  float viewport_bottom = 0.0f;
+  float viewport_near_depth = 0.0f;
+  float viewport_far_depth = 0.0f;
+  int backbuffer_width = 0;
+  int backbuffer_height = 0;
+  int target_left = 0;
+  int target_top = 0;
+  int target_right = 0;
+  int target_bottom = 0;
+};
+
+struct SMGPCDolphinTevOrderTraceState
+{
+  u32 stage = 0;
+  bool texture_enabled = false;
+  u32 tex_coord = 0;
+  u32 tex_map = 0;
+  u32 color_channel = 0;
+};
+
+struct SMGPCDolphinTevStageTraceState
+{
+  u32 stage = 0;
+  u32 color_raw = 0;
+  u32 alpha_raw = 0;
+};
+
+struct SMGPCDolphinColorChannelTraceState
+{
+  u32 channel = 0;
+  u32 color_raw = 0;
+  u32 alpha_raw = 0;
+  u32 color_light_mask = 0;
+  u32 alpha_light_mask = 0;
+};
+
+struct SMGPCDolphinLightTraceState
+{
+  bool active = false;
+  u32 index = 0;
+  std::array<u8, 4> color_rgba{};
+  std::array<u8, 4> color_abgr{};
+  std::array<float, 3> cosine_attenuation{};
+  std::array<float, 3> distance_attenuation{};
+  std::array<float, 3> position{};
+  std::array<float, 3> direction{};
+};
+
+struct SMGPCDolphinTextureTraceState
+{
+  bool active = false;
+  u32 slot = 0;
+  u32 address = 0;
+  u32 width = 0;
+  u32 height = 0;
+  u32 expanded_width = 0;
+  u32 expanded_height = 0;
+  u32 texture_size = 0;
+  u32 texture_format = 0;
+  u32 tlut_format = 0;
+  u32 wrap_s = 0;
+  u32 wrap_t = 0;
+  u32 min_filter = 0;
+  u32 mag_filter = 0;
+  u32 mipmap_filter = 0;
+  s32 lod_bias = 0;
+  u32 min_lod = 0;
+  u32 max_lod = 0;
+  bool from_tmem = false;
+  bool data_valid = false;
+  bool has_mipmaps = false;
+  u32 tex_mode0_raw = 0;
+  u32 tex_mode1_raw = 0;
+  u32 tex_image0_raw = 0;
+  u32 tex_image1_raw = 0;
+  u32 tex_image2_raw = 0;
+  u32 tex_image3_raw = 0;
+  u32 tex_tlut_raw = 0;
+  std::string texture_format_name;
+  std::string tlut_format_name;
+  std::string identity_name;
+};
+
+struct SMGPCDolphinDrawTraceEvent
+{
+  u32 draw_index = 0;
+  int presenter_frame_count = 0;
+  PrimitiveType primitive_type = PrimitiveType::Triangles;
+  u32 num_vertices = 0;
+  u32 num_indices = 0;
+  u32 base_vertex = 0;
+  u32 base_index = 0;
+  u32 used_textures_mask = 0;
+  u32 texgen_count = 0;
+  u32 color_channel_count = 0;
+  u32 tev_stage_count = 0;
+  u32 indirect_stage_count = 0;
+  u32 gen_mode_raw = 0;
+  u32 cull_mode = 0;
+  u32 z_mode_raw = 0;
+  bool z_compare_enable = false;
+  u32 z_function = 0;
+  bool z_update_enable = false;
+  u32 blend_mode_raw = 0;
+  bool blend_enable = false;
+  bool logic_op_enable = false;
+  bool color_update = false;
+  bool alpha_update = false;
+  u32 src_blend_factor = 0;
+  u32 dst_blend_factor = 0;
+  u32 alpha_compare_raw = 0;
+  u32 alpha_comp0 = 0;
+  u32 alpha_ref0 = 0;
+  u32 alpha_op = 0;
+  u32 alpha_comp1 = 0;
+  u32 alpha_ref1 = 0;
+  u32 fog_raw[5] = {};
+  std::array<SMGPCDolphinTevOrderTraceState, 16> tev_orders{};
+  std::array<SMGPCDolphinTevStageTraceState, 16> tev_stages{};
+  std::array<SMGPCDolphinColorChannelTraceState, 2> color_channels{};
+  std::array<SMGPCDolphinLightTraceState, 8> lights{};
+  std::array<SMGPCDolphinTextureTraceState, 8> textures{};
+  u32 requested_light_mask = 0;
+  u32 loaded_light_mask = 0;
+};
+
+std::vector<SMGPCDolphinCopyTraceEvent> s_smgpc_dolphin_copy_trace_events;
+std::vector<SMGPCDolphinDrawTraceEvent> s_smgpc_dolphin_draw_trace_events;
+u64 s_smgpc_dolphin_copy_trace_event_index = 0;
+bool s_smgpc_dolphin_copy_trace_completed = false;
+
+std::optional<int> GetSMGPCDolphinTraceFrame()
+{
+  const char* value = std::getenv("SMGPC_DOLPHIN_TRACE_FRAME");
+  if (value == nullptr || value[0] == '\0')
+    return std::nullopt;
+
+  const auto text = std::string_view(value);
+  int frame = 0;
+  const auto* begin = text.data();
+  const auto* end = begin + text.size();
+  const auto result = std::from_chars(begin, end, frame);
+  if (result.ec != std::errc{} || result.ptr != end || frame < 0)
+    return std::nullopt;
+
+  return frame;
+}
+
+std::optional<int> GetSMGPCDolphinTraceWindow()
+{
+  const char* value = std::getenv("SMGPC_DOLPHIN_TRACE_WINDOW");
+  if (value == nullptr || value[0] == '\0')
+    return 0;
+
+  const auto text = std::string_view(value);
+  int window = 0;
+  const auto* begin = text.data();
+  const auto* end = begin + text.size();
+  const auto result = std::from_chars(begin, end, window);
+  if (result.ec != std::errc{} || result.ptr != end || window < 0)
+    return 0;
+
+  return window;
+}
+
+std::optional<std::string> GetSMGPCDolphinTracePath()
+{
+  const char* value = std::getenv("SMGPC_DOLPHIN_TRACE_PATH");
+  if (value == nullptr || value[0] == '\0')
+    return std::nullopt;
+
+  return std::string(value);
+}
+
+const char* BoolJson(bool value)
+{
+  return value ? "true" : "false";
+}
+
+template <typename T>
+void WriteJsonField(std::ostream& out, std::string_view name, const T& value, bool trailing_comma)
+{
+  out << "      \"" << name << "\": " << value;
+  if (trailing_comma)
+    out << ',';
+  out << '\n';
+}
+
+const char* PrimitiveTypeName(PrimitiveType primitive_type)
+{
+  switch (primitive_type)
+  {
+  case PrimitiveType::Points:
+    return "points";
+  case PrimitiveType::Lines:
+    return "lines";
+  case PrimitiveType::Triangles:
+    return "triangles";
+  case PrimitiveType::TriangleStrip:
+    return "triangle_strip";
+  }
+
+  return "unknown";
+}
+
+const char* TextureFormatName(TextureFormat format)
+{
+  switch (format)
+  {
+  case TextureFormat::I4:
+    return "I4";
+  case TextureFormat::I8:
+    return "I8";
+  case TextureFormat::IA4:
+    return "IA4";
+  case TextureFormat::IA8:
+    return "IA8";
+  case TextureFormat::RGB565:
+    return "RGB565";
+  case TextureFormat::RGB5A3:
+    return "RGB5A3";
+  case TextureFormat::RGBA8:
+    return "RGBA8";
+  case TextureFormat::C4:
+    return "C4";
+  case TextureFormat::C8:
+    return "C8";
+  case TextureFormat::C14X2:
+    return "C14X2";
+  case TextureFormat::CMPR:
+    return "CMPR";
+  case TextureFormat::XFB:
+    return "XFB";
+  }
+
+  return "Unknown";
+}
+
+const char* TlutFormatName(TLUTFormat format)
+{
+  switch (format)
+  {
+  case TLUTFormat::IA8:
+    return "IA8";
+  case TLUTFormat::RGB565:
+    return "RGB565";
+  case TLUTFormat::RGB5A3:
+    return "RGB5A3";
+  }
+
+  return "Unknown";
+}
+
+void WriteUsedTextureSlots(std::ostream& out, u32 used_textures_mask)
+{
+  bool needs_comma = false;
+  for (u32 slot = 0; slot < 8; ++slot)
+  {
+    if ((used_textures_mask & (1u << slot)) == 0)
+      continue;
+
+    if (needs_comma)
+      out << ", ";
+    out << slot;
+    needs_comma = true;
+  }
+}
+
+void WriteJsonFloat(std::ostream& out, float value)
+{
+  if (!std::isfinite(value))
+  {
+    out << "null";
+    return;
+  }
+
+  out << value;
+}
+
+void WriteFloat3(std::ostream& out, const std::array<float, 3>& values)
+{
+  out << '[';
+  for (std::size_t i = 0; i < values.size(); ++i)
+  {
+    if (i != 0)
+      out << ", ";
+    WriteJsonFloat(out, values[i]);
+  }
+  out << ']';
+}
+
+void WriteColor4(std::ostream& out, const std::array<u8, 4>& values)
+{
+  out << '[' << static_cast<u32>(values[0]) << ", " << static_cast<u32>(values[1]) << ", "
+      << static_cast<u32>(values[2]) << ", " << static_cast<u32>(values[3]) << ']';
+}
+
+void WriteTextureBinding(const SMGPCDolphinTextureTraceState& texture, std::ostream& out)
+{
+  out << "        {\"slot\": " << texture.slot
+      << ", \"address\": " << texture.address
+      << ", \"width\": " << texture.width
+      << ", \"height\": " << texture.height
+      << ", \"expanded_width\": " << texture.expanded_width
+      << ", \"expanded_height\": " << texture.expanded_height
+      << ", \"texture_size\": " << texture.texture_size
+      << ", \"format\": \"" << texture.texture_format_name << "\""
+      << ", \"format_raw\": " << texture.texture_format
+      << ", \"tlut_format\": \"" << texture.tlut_format_name << "\""
+      << ", \"tlut_format_raw\": " << texture.tlut_format
+      << ", \"wrap_s\": " << texture.wrap_s
+      << ", \"wrap_t\": " << texture.wrap_t
+      << ", \"min_filter\": " << texture.min_filter
+      << ", \"mag_filter\": " << texture.mag_filter
+      << ", \"mipmap_filter\": " << texture.mipmap_filter
+      << ", \"lod_bias\": " << texture.lod_bias
+      << ", \"min_lod\": " << texture.min_lod
+      << ", \"max_lod\": " << texture.max_lod
+      << ", \"from_tmem\": " << BoolJson(texture.from_tmem)
+      << ", \"data_valid\": " << BoolJson(texture.data_valid)
+      << ", \"has_mipmaps\": " << BoolJson(texture.has_mipmaps)
+      << ", \"tex_mode0_raw\": " << texture.tex_mode0_raw
+      << ", \"tex_mode1_raw\": " << texture.tex_mode1_raw
+      << ", \"tex_image0_raw\": " << texture.tex_image0_raw
+      << ", \"tex_image1_raw\": " << texture.tex_image1_raw
+      << ", \"tex_image2_raw\": " << texture.tex_image2_raw
+      << ", \"tex_image3_raw\": " << texture.tex_image3_raw
+      << ", \"tex_tlut_raw\": " << texture.tex_tlut_raw
+      << ", \"identity_name\": \"" << texture.identity_name << "\"}";
+}
+
+void WriteSMGPCDolphinDrawTraceEvents(std::ostream& out)
+{
+  out << "  \"render_packets\": [\n";
+  for (std::size_t i = 0; i < s_smgpc_dolphin_draw_trace_events.size(); ++i)
+  {
+    const auto& event = s_smgpc_dolphin_draw_trace_events[i];
+    const auto tev_stage_count = std::min<std::size_t>(event.tev_stage_count, 16);
+    const auto color_channel_count = std::min<std::size_t>(event.color_channel_count, 2);
+
+    out << "    {\n";
+    WriteJsonField(out, "index", i, true);
+    WriteJsonField(out, "draw_index", event.draw_index, true);
+    WriteJsonField(out, "presenter_frame_count", event.presenter_frame_count, true);
+    WriteJsonField(out, "frame_index", event.presenter_frame_count, true);
+    out << "      \"model_name\": null,\n";
+    out << "      \"material_name\": null,\n";
+    out << "      \"render_pass\": \"GXDraw\",\n";
+    WriteJsonField(out, "view_id", 0, true);
+    out << "      \"primitive_type\": \"" << PrimitiveTypeName(event.primitive_type) << "\",\n";
+    WriteJsonField(out, "primitive_type_raw", static_cast<u32>(event.primitive_type), true);
+    WriteJsonField(out, "num_vertices", event.num_vertices, true);
+    WriteJsonField(out, "num_indices", event.num_indices, true);
+    WriteJsonField(out, "base_vertex", event.base_vertex, true);
+    WriteJsonField(out, "base_index", event.base_index, true);
+    WriteJsonField(out, "used_textures_mask", event.used_textures_mask, true);
+    out << "      \"used_texture_slots\": [";
+    WriteUsedTextureSlots(out, event.used_textures_mask);
+    out << "],\n";
+    out << "      \"texture_bindings\": [\n";
+    bool needs_texture_comma = false;
+    for (const auto& texture : event.textures)
+    {
+      if (!texture.active)
+        continue;
+
+      if (needs_texture_comma)
+        out << ",\n";
+      WriteTextureBinding(texture, out);
+      needs_texture_comma = true;
+    }
+    out << '\n';
+    out << "      ],\n";
+    out << "      \"gen_mode\": {\"raw\": " << event.gen_mode_raw
+        << ", \"texgen_count\": " << event.texgen_count
+        << ", \"color_channel_count\": " << event.color_channel_count
+        << ", \"tev_stage_count\": " << event.tev_stage_count
+        << ", \"indirect_stage_count\": " << event.indirect_stage_count
+        << ", \"cull_mode\": " << event.cull_mode << "},\n";
+    out << "      \"gx_z_mode\": {\"raw\": " << event.z_mode_raw
+        << ", \"compare_enable\": " << BoolJson(event.z_compare_enable)
+        << ", \"function\": " << event.z_function
+        << ", \"update_enable\": " << BoolJson(event.z_update_enable) << "},\n";
+    out << "      \"gx_blend\": {\"raw\": " << event.blend_mode_raw
+        << ", \"enabled\": " << BoolJson(event.blend_enable)
+        << ", \"logic_op_enable\": " << BoolJson(event.logic_op_enable)
+        << ", \"color_update\": " << BoolJson(event.color_update)
+        << ", \"alpha_update\": " << BoolJson(event.alpha_update)
+        << ", \"src_factor\": " << event.src_blend_factor
+        << ", \"dst_factor\": " << event.dst_blend_factor << "},\n";
+    out << "      \"gx_alpha_compare\": {\"raw\": " << event.alpha_compare_raw
+        << ", \"comp0\": " << event.alpha_comp0 << ", \"ref0\": " << event.alpha_ref0
+        << ", \"op\": " << event.alpha_op << ", \"comp1\": " << event.alpha_comp1
+        << ", \"ref1\": " << event.alpha_ref1 << "},\n";
+    out << "      \"gx_fog\": {\"a_raw\": " << event.fog_raw[0]
+        << ", \"b_magnitude\": " << event.fog_raw[1] << ", \"b_shift\": " << event.fog_raw[2]
+        << ", \"c_proj_fsel_raw\": " << event.fog_raw[3] << ", \"color_raw\": " << event.fog_raw[4]
+        << "},\n";
+    out << "      \"tev_orders\": [\n";
+    for (std::size_t stage = 0; stage < tev_stage_count; ++stage)
+    {
+      const auto& order = event.tev_orders[stage];
+      out << "        {\"stage\": " << order.stage
+          << ", \"texture_enabled\": " << BoolJson(order.texture_enabled)
+          << ", \"tex_coord\": " << order.tex_coord << ", \"tex_map\": " << order.tex_map
+          << ", \"color_channel\": " << order.color_channel << "}";
+      if (stage + 1U < tev_stage_count)
+        out << ',';
+      out << '\n';
+    }
+    out << "      ],\n";
+    out << "      \"tev_stages\": [\n";
+    for (std::size_t stage = 0; stage < tev_stage_count; ++stage)
+    {
+      const auto& tev_stage = event.tev_stages[stage];
+      out << "        {\"stage\": " << tev_stage.stage << ", \"color_raw\": " << tev_stage.color_raw
+          << ", \"alpha_raw\": " << tev_stage.alpha_raw << "}";
+      if (stage + 1U < tev_stage_count)
+        out << ',';
+      out << '\n';
+    }
+    out << "      ],\n";
+    out << "      \"color_channels\": [\n";
+    for (std::size_t channel = 0; channel < color_channel_count; ++channel)
+    {
+      const auto& color_channel = event.color_channels[channel];
+      out << "        {\"channel\": " << color_channel.channel
+          << ", \"color_raw\": " << color_channel.color_raw
+          << ", \"alpha_raw\": " << color_channel.alpha_raw
+          << ", \"color_light_mask\": " << color_channel.color_light_mask
+          << ", \"alpha_light_mask\": " << color_channel.alpha_light_mask << "}";
+      if (channel + 1U < color_channel_count)
+        out << ',';
+      out << '\n';
+    }
+    out << "      ],\n";
+    WriteJsonField(out, "requested_light_mask", event.requested_light_mask, true);
+    WriteJsonField(out, "loaded_light_mask", event.loaded_light_mask, true);
+    out << "      \"lights\": [\n";
+    bool needs_light_comma = false;
+    for (const auto& light : event.lights)
+    {
+      if (!light.active)
+        continue;
+
+      if (needs_light_comma)
+        out << ",\n";
+      out << "        {\"index\": " << light.index << ", \"color\": ";
+      WriteColor4(out, light.color_rgba);
+      out << ", \"color_abgr\": ";
+      WriteColor4(out, light.color_abgr);
+      out << ", \"cosine_attenuation\": ";
+      WriteFloat3(out, light.cosine_attenuation);
+      out << ", \"distance_attenuation\": ";
+      WriteFloat3(out, light.distance_attenuation);
+      out << ", \"position\": ";
+      WriteFloat3(out, light.position);
+      out << ", \"direction\": ";
+      WriteFloat3(out, light.direction);
+      out << "}";
+      needs_light_comma = true;
+    }
+    out << '\n';
+    out << "      ]\n";
+    out << "    }";
+    if (i + 1U < s_smgpc_dolphin_draw_trace_events.size())
+      out << ',';
+    out << '\n';
+  }
+  out << "  ],\n";
+}
+
+void WriteSMGPCDolphinCopyTrace(const std::string& path, int requested_frame, int window)
+{
+  if (!File::CreateFullPath(path))
+    return;
+
+  std::ofstream out(path);
+  if (!out)
+    return;
+
+  const auto current_frame = g_presenter ? g_presenter->FrameCount() : 0;
+  out << "{\n";
+  out << "  \"schema\": \"smgpc-dolphin-parity-trace-v1\",\n";
+  out << "  \"emulator\": \"dolphin\",\n";
+  out << "  \"requested_frame\": " << requested_frame << ",\n";
+  out << "  \"trace_window\": " << window << ",\n";
+  out << "  \"frame\": {\n";
+  out << "    \"index\": " << requested_frame << ",\n";
+  out << "    \"dolphin_presenter_frame_count\": " << current_frame << ",\n";
+  out << "    \"framebuffer\": {\n";
+  out << "      \"width\": " << (g_presenter ? g_presenter->GetBackbufferWidth() : 0) << ",\n";
+  out << "      \"height\": " << (g_presenter ? g_presenter->GetBackbufferHeight() : 0) << "\n";
+  out << "    }\n";
+  out << "  },\n";
+  out << "  \"camera_pose\": null,\n";
+  out << "  \"scene_snapshot\": [],\n";
+  out << "  \"scene_trace\": [],\n";
+  out << "  \"layout_runtime\": [],\n";
+  WriteSMGPCDolphinDrawTraceEvents(out);
+  out << "  \"copy_events\": [\n";
+  for (std::size_t i = 0; i < s_smgpc_dolphin_copy_trace_events.size(); ++i)
+  {
+    const auto& event = s_smgpc_dolphin_copy_trace_events[i];
+    out << "    {\n";
+    WriteJsonField(out, "index", i, true);
+    WriteJsonField(out, "event_index", event.event_index, true);
+    WriteJsonField(out, "presenter_frame_count", event.presenter_frame_count, true);
+    out << "      \"kind\": \"" << (event.copy_to_xfb ? "xfb" : "texture") << "\",\n";
+    WriteJsonField(out, "copy_to_xfb", BoolJson(event.copy_to_xfb), true);
+    WriteJsonField(out, "depth_copy", BoolJson(event.depth_copy), true);
+    WriteJsonField(out, "clear", BoolJson(event.clear), true);
+    WriteJsonField(out, "half_scale", BoolJson(event.half_scale), true);
+    WriteJsonField(out, "scale_invert", BoolJson(event.scale_invert), true);
+    WriteJsonField(out, "clamp_top", BoolJson(event.clamp_top), true);
+    WriteJsonField(out, "clamp_bottom", BoolJson(event.clamp_bottom), true);
+    WriteJsonField(out, "intensity_format", BoolJson(event.intensity_format), true);
+    WriteJsonField(out, "auto_conversion", BoolJson(event.auto_conversion), true);
+    WriteJsonField(out, "dest_addr", event.dest_addr, true);
+    WriteJsonField(out, "dest_stride", event.dest_stride, true);
+    out << "      \"source_rect\": {\"left\": " << event.src_left << ", \"top\": " << event.src_top
+        << ", \"right\": " << event.src_right << ", \"bottom\": " << event.src_bottom
+        << ", \"width\": " << event.copy_width << ", \"height\": " << event.copy_height << "},\n";
+    out << "      \"output_size\": {\"width\": " << event.output_width
+        << ", \"height\": " << event.output_height << "},\n";
+    WriteJsonField(out, "target_pixel_format", event.target_pixel_format, true);
+    WriteJsonField(out, "real_format", event.real_format, true);
+    WriteJsonField(out, "frame_to_field", event.frame_to_field, true);
+    WriteJsonField(out, "gamma_index", event.gamma_index, true);
+    WriteJsonField(out, "gamma_value", event.gamma_value, true);
+    WriteJsonField(out, "y_scale", event.y_scale, true);
+    WriteJsonField(out, "dispcopyyscale", event.dispcopyyscale, true);
+    out << "      \"scissor\": {\"tl_raw\": " << event.scissor_tl_raw
+        << ", \"br_raw\": " << event.scissor_br_raw
+        << ", \"offset_raw\": " << event.scissor_offset_raw << "},\n";
+    out << "      \"viewport\": {\"left\": " << event.viewport_left
+        << ", \"right\": " << event.viewport_right << ", \"top\": " << event.viewport_top
+        << ", \"bottom\": " << event.viewport_bottom
+        << ", \"near_depth\": " << event.viewport_near_depth
+        << ", \"far_depth\": " << event.viewport_far_depth << "},\n";
+    out << "      \"backbuffer\": {\"width\": " << event.backbuffer_width
+        << ", \"height\": " << event.backbuffer_height << "},\n";
+    out << "      \"target_rect\": {\"left\": " << event.target_left
+        << ", \"top\": " << event.target_top << ", \"right\": " << event.target_right
+        << ", \"bottom\": " << event.target_bottom << "}\n";
+    out << "    }";
+    if (i + 1U < s_smgpc_dolphin_copy_trace_events.size())
+      out << ',';
+    out << '\n';
+  }
+  out << "  ]\n";
+  out << "}\n";
+}
+
+void RecordSMGPCDolphinCopyTrace(bool copy_to_xfb, const MathUtil::Rectangle<s32>& src_rect,
+                                 u32 output_height, u32 dest_addr, u32 dest_stride,
+                                 bool is_depth_copy, float y_scale, const UPE_Copy& pe_copy)
+{
+  ++s_smgpc_dolphin_copy_trace_event_index;
+
+  const auto target_frame = GetSMGPCDolphinTraceFrame();
+  const auto trace_path = GetSMGPCDolphinTracePath();
+  const auto trace_window = GetSMGPCDolphinTraceWindow();
+  if (!target_frame.has_value() || !trace_path.has_value() || !trace_window.has_value() ||
+      s_smgpc_dolphin_copy_trace_completed)
+  {
+    return;
+  }
+
+  const auto current_frame = g_presenter ? g_presenter->FrameCount() : 0;
+  const auto min_frame = std::max(0, *target_frame - *trace_window);
+  const auto max_frame = *target_frame + *trace_window;
+  if (current_frame < min_frame)
+    return;
+
+  if (current_frame <= max_frame)
+  {
+    const auto viewport_left = xfmem.viewport.xOrig - xfmem.viewport.wd;
+    const auto viewport_right = xfmem.viewport.xOrig + xfmem.viewport.wd;
+    const auto viewport_top = xfmem.viewport.yOrig - xfmem.viewport.ht;
+    const auto viewport_bottom = xfmem.viewport.yOrig + xfmem.viewport.ht;
+    const auto near_depth = (xfmem.viewport.farZ - xfmem.viewport.zRange) / 16777216.0f;
+    const auto far_depth = xfmem.viewport.farZ / 16777216.0f;
+    const auto target_rect =
+        g_presenter ? g_presenter->GetTargetRectangle() : MathUtil::Rectangle<int>();
+    s_smgpc_dolphin_copy_trace_events.push_back(SMGPCDolphinCopyTraceEvent{
+        .event_index = s_smgpc_dolphin_copy_trace_event_index,
+        .presenter_frame_count = current_frame,
+        .copy_to_xfb = copy_to_xfb,
+        .depth_copy = is_depth_copy,
+        .clear = pe_copy.clear,
+        .half_scale = pe_copy.half_scale,
+        .scale_invert = pe_copy.scale_invert,
+        .clamp_top = pe_copy.clamp_top,
+        .clamp_bottom = pe_copy.clamp_bottom,
+        .intensity_format = pe_copy.intensity_fmt,
+        .auto_conversion = pe_copy.auto_conv,
+        .dest_addr = dest_addr,
+        .dest_stride = dest_stride,
+        .src_left = static_cast<u32>(src_rect.left),
+        .src_top = static_cast<u32>(src_rect.top),
+        .src_right = static_cast<u32>(src_rect.right),
+        .src_bottom = static_cast<u32>(src_rect.bottom),
+        .copy_width = static_cast<u32>(src_rect.GetWidth()),
+        .copy_height = static_cast<u32>(src_rect.GetHeight()),
+        .output_width = static_cast<u32>(src_rect.GetWidth()),
+        .output_height = output_height,
+        .target_pixel_format = pe_copy.target_pixel_format,
+        .real_format = static_cast<u32>(pe_copy.tp_realFormat()),
+        .frame_to_field = static_cast<u32>(pe_copy.frame_to_field.Value()),
+        .gamma_index = static_cast<u32>(pe_copy.gamma.Value()),
+        .gamma_value = s_gammaLUT[pe_copy.gamma],
+        .y_scale = y_scale,
+        .dispcopyyscale = bpmem.dispcopyyscale,
+        .scissor_tl_raw = bpmem.scissorTL.hex,
+        .scissor_br_raw = bpmem.scissorBR.hex,
+        .scissor_offset_raw = bpmem.scissorOffset.hex,
+        .viewport_left = viewport_left,
+        .viewport_right = viewport_right,
+        .viewport_top = viewport_top,
+        .viewport_bottom = viewport_bottom,
+        .viewport_near_depth = near_depth,
+        .viewport_far_depth = far_depth,
+        .backbuffer_width = g_presenter ? g_presenter->GetBackbufferWidth() : 0,
+        .backbuffer_height = g_presenter ? g_presenter->GetBackbufferHeight() : 0,
+        .target_left = target_rect.left,
+        .target_top = target_rect.top,
+        .target_right = target_rect.right,
+        .target_bottom = target_rect.bottom,
+    });
+  }
+
+  if (!s_smgpc_dolphin_copy_trace_events.empty() && current_frame >= *target_frame)
+    WriteSMGPCDolphinCopyTrace(*trace_path, *target_frame, *trace_window);
+
+  if (current_frame > max_frame)
+    s_smgpc_dolphin_copy_trace_completed = true;
+}
+}  // namespace
+
+void RecordSMGPCDolphinDrawTrace(u32 draw_index, PrimitiveType primitive_type, u32 num_vertices,
+                                 u32 num_indices, u32 base_vertex, u32 base_index,
+                                 u32 used_textures_mask)
+{
+  const auto target_frame = GetSMGPCDolphinTraceFrame();
+  const auto trace_path = GetSMGPCDolphinTracePath();
+  const auto trace_window = GetSMGPCDolphinTraceWindow();
+  if (!target_frame.has_value() || !trace_path.has_value() || !trace_window.has_value() ||
+      s_smgpc_dolphin_copy_trace_completed)
+  {
+    return;
+  }
+
+  const auto current_frame = g_presenter ? g_presenter->FrameCount() : 0;
+  const auto min_frame = std::max(0, *target_frame - *trace_window);
+  const auto max_frame = *target_frame + *trace_window;
+  if (current_frame < min_frame || current_frame > max_frame)
+    return;
+
+  SMGPCDolphinDrawTraceEvent event = {};
+  event.draw_index = draw_index;
+  event.presenter_frame_count = current_frame;
+  event.primitive_type = primitive_type;
+  event.num_vertices = num_vertices;
+  event.num_indices = num_indices;
+  event.base_vertex = base_vertex;
+  event.base_index = base_index;
+  event.used_textures_mask = used_textures_mask;
+  event.texgen_count = bpmem.genMode.numtexgens.Value();
+  event.color_channel_count = bpmem.genMode.numcolchans.Value();
+  event.tev_stage_count = bpmem.genMode.numtevstages.Value() + 1;
+  event.indirect_stage_count = bpmem.genMode.numindstages.Value();
+  event.gen_mode_raw = bpmem.genMode.hex;
+  event.cull_mode = static_cast<u32>(bpmem.genMode.cull_mode.Value());
+  event.z_mode_raw = bpmem.zmode.hex;
+  event.z_compare_enable = bpmem.zmode.test_enable.Value();
+  event.z_function = static_cast<u32>(bpmem.zmode.func.Value());
+  event.z_update_enable = bpmem.zmode.update_enable.Value();
+  event.blend_mode_raw = bpmem.blendmode.hex;
+  event.blend_enable = bpmem.blendmode.blend_enable.Value();
+  event.logic_op_enable = bpmem.blendmode.logic_op_enable.Value();
+  event.color_update = bpmem.blendmode.color_update.Value();
+  event.alpha_update = bpmem.blendmode.alpha_update.Value();
+  event.src_blend_factor = static_cast<u32>(bpmem.blendmode.src_factor.Value());
+  event.dst_blend_factor = static_cast<u32>(bpmem.blendmode.dst_factor.Value());
+  event.alpha_compare_raw = bpmem.alpha_test.hex;
+  event.alpha_comp0 = static_cast<u32>(bpmem.alpha_test.comp0.Value());
+  event.alpha_ref0 = bpmem.alpha_test.ref0.Value();
+  event.alpha_op = static_cast<u32>(bpmem.alpha_test.logic.Value());
+  event.alpha_comp1 = static_cast<u32>(bpmem.alpha_test.comp1.Value());
+  event.alpha_ref1 = bpmem.alpha_test.ref1.Value();
+  event.fog_raw[0] = bpmem.fog.a.hex;
+  event.fog_raw[1] = bpmem.fog.b_magnitude;
+  event.fog_raw[2] = bpmem.fog.b_shift;
+  event.fog_raw[3] = bpmem.fog.c_proj_fsel.hex;
+  event.fog_raw[4] = bpmem.fog.color.hex;
+
+  for (u32 slot = 0; slot < event.textures.size(); ++slot)
+  {
+    if ((used_textures_mask & (1u << slot)) == 0)
+      continue;
+
+    const auto& tex = bpmem.tex.GetUnit(slot);
+    const auto texture_info = TextureInfo::FromStage(slot);
+    std::string identity_name;
+    if (texture_info.IsDataValid())
+      identity_name = texture_info.CalculateTextureName().GetFullName();
+
+    event.textures[slot] = SMGPCDolphinTextureTraceState{
+        .active = true,
+        .slot = slot,
+        .address = texture_info.GetRawAddress(),
+        .width = texture_info.GetRawWidth(),
+        .height = texture_info.GetRawHeight(),
+        .expanded_width = texture_info.GetExpandedWidth(),
+        .expanded_height = texture_info.GetExpandedHeight(),
+        .texture_size = texture_info.GetTextureSize(),
+        .texture_format = static_cast<u32>(texture_info.GetTextureFormat()),
+        .tlut_format = static_cast<u32>(texture_info.GetTlutFormat()),
+        .wrap_s = static_cast<u32>(tex.texMode0.wrap_s.Value()),
+        .wrap_t = static_cast<u32>(tex.texMode0.wrap_t.Value()),
+        .min_filter = static_cast<u32>(tex.texMode0.min_filter.Value()),
+        .mag_filter = static_cast<u32>(tex.texMode0.mag_filter.Value()),
+        .mipmap_filter = static_cast<u32>(tex.texMode0.mipmap_filter.Value()),
+        .lod_bias = tex.texMode0.lod_bias.Value(),
+        .min_lod = tex.texMode1.min_lod.Value(),
+        .max_lod = tex.texMode1.max_lod.Value(),
+        .from_tmem = texture_info.IsFromTmem(),
+        .data_valid = texture_info.IsDataValid(),
+        .has_mipmaps = texture_info.HasMipMaps(),
+        .tex_mode0_raw = tex.texMode0.hex,
+        .tex_mode1_raw = tex.texMode1.hex,
+        .tex_image0_raw = tex.texImage0.hex,
+        .tex_image1_raw = tex.texImage1.hex,
+        .tex_image2_raw = tex.texImage2.hex,
+        .tex_image3_raw = tex.texImage3.hex,
+        .tex_tlut_raw = tex.texTlut.hex,
+        .texture_format_name = TextureFormatName(texture_info.GetTextureFormat()),
+        .tlut_format_name = TlutFormatName(texture_info.GetTlutFormat()),
+        .identity_name = std::move(identity_name),
+    };
+  }
+
+  const auto tev_stage_count = std::min<u32>(event.tev_stage_count, 16);
+  for (u32 stage = 0; stage < tev_stage_count; ++stage)
+  {
+    const auto& order = bpmem.tevorders[stage / 2];
+    const auto order_slot = static_cast<int>(stage & 1);
+    event.tev_orders[stage] = SMGPCDolphinTevOrderTraceState{
+        .stage = stage,
+        .texture_enabled = order.getEnable(order_slot) != 0,
+        .tex_coord = order.getTexCoord(order_slot),
+        .tex_map = order.getTexMap(order_slot),
+        .color_channel = static_cast<u32>(order.getColorChan(order_slot)),
+    };
+    event.tev_stages[stage] = SMGPCDolphinTevStageTraceState{
+        .stage = stage,
+        .color_raw = bpmem.combiners[stage].colorC.hex,
+        .alpha_raw = bpmem.combiners[stage].alphaC.hex,
+    };
+  }
+
+  const auto color_channel_count = std::min<u32>(event.color_channel_count, 2);
+  for (u32 channel = 0; channel < color_channel_count; ++channel)
+  {
+    const auto color_light_mask = xfmem.color[channel].GetFullLightMask();
+    const auto alpha_light_mask = xfmem.alpha[channel].GetFullLightMask();
+    event.color_channels[channel] = SMGPCDolphinColorChannelTraceState{
+        .channel = channel,
+        .color_raw = xfmem.color[channel].hex,
+        .alpha_raw = xfmem.alpha[channel].hex,
+        .color_light_mask = color_light_mask,
+        .alpha_light_mask = alpha_light_mask,
+    };
+    event.requested_light_mask |= color_light_mask | alpha_light_mask;
+  }
+
+  event.loaded_light_mask = event.requested_light_mask;
+  for (std::size_t light_index = 0; light_index < event.lights.size(); ++light_index)
+  {
+    if ((event.requested_light_mask & (1u << light_index)) == 0)
+      continue;
+
+    const auto& light = xfmem.lights[light_index];
+    event.lights[light_index] = SMGPCDolphinLightTraceState{
+        .active = true,
+        .index = static_cast<u32>(light_index),
+        .color_rgba = {light.color[3], light.color[2], light.color[1], light.color[0]},
+        .color_abgr = {light.color[0], light.color[1], light.color[2], light.color[3]},
+        .cosine_attenuation = {light.cosatt[0], light.cosatt[1], light.cosatt[2]},
+        .distance_attenuation = {light.distatt[0], light.distatt[1], light.distatt[2]},
+        .position = {light.dpos[0], light.dpos[1], light.dpos[2]},
+        .direction = {light.ddir[0], light.ddir[1], light.ddir[2]},
+    };
+  }
+
+  s_smgpc_dolphin_draw_trace_events.push_back(event);
+}
 
 void BPInit()
 {
@@ -306,6 +1156,8 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
         // bpmem.zcontrol.pixel_format to PixelFormat::Z24 is when the game wants to copy from
         // ZBuffer (Zbuffer uses 24-bit Format)
         bool is_depth_copy = bpmem.zcontrol.pixel_format == PixelFormat::Z24;
+        RecordSMGPCDolphinCopyTrace(false, srcRect, copy_height, destAddr, destStride,
+                                    is_depth_copy, 1.0f, PE_copy);
         g_texture_cache->CopyRenderTargetToTexture(
             destAddr, PE_copy.tp_realFormat(), copy_width, copy_height, destStride, is_depth_copy,
             srcRect, PE_copy.intensity_fmt && PE_copy.auto_conv, PE_copy.half_scale, 1.0f,
@@ -336,6 +1188,8 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
                       bpmem.copyTexSrcWH.x + 1, destStride, height, yScale);
 
         bool is_depth_copy = bpmem.zcontrol.pixel_format == PixelFormat::Z24;
+        RecordSMGPCDolphinCopyTrace(true, srcRect, height, destAddr, destStride, is_depth_copy,
+                                    yScale, PE_copy);
         g_texture_cache->CopyRenderTargetToTexture(
             destAddr, EFBCopyFormat::XFB, copy_width, height, destStride, is_depth_copy, srcRect,
             false, false, yScale, s_gammaLUT[PE_copy.gamma], bpmem.triggerEFBCopy.clamp_top,

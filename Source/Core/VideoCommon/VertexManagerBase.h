@@ -227,7 +227,7 @@ private:
                       GeometryShaderManager& geometry_shader_manager,
                       const CustomPixelShaderContents& custom_pixel_shader_contents,
                       std::span<u8> custom_pixel_shader_uniforms, PrimitiveType primitive_type,
-                      const AbstractPipeline* current_pipeline);
+                      const AbstractPipeline* current_pipeline, u32 used_textures_mask);
   void UpdatePipelineConfig();
   void UpdatePipelineObject();
 

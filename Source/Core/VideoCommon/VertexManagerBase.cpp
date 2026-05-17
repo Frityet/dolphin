@@ -34,6 +34,7 @@
 #include "VideoCommon/PerfQueryBase.h"
 #include "VideoCommon/PixelShaderGen.h"
 #include "VideoCommon/PixelShaderManager.h"
+#include "VideoCommon/SMGPCParityTrace.h"
 #include "VideoCommon/Statistics.h"
 #include "VideoCommon/TextureCacheBase.h"
 #include "VideoCommon/VertexLoaderManager.h"
@@ -659,7 +660,8 @@ void VertexManagerBase::Flush()
           }
         }
         RenderDrawCall(pixel_shader_manager, geometry_shader_manager, custom_pixel_shader_contents,
-                       custom_pixel_shader_uniforms, m_current_primitive_type, pipeline_object);
+                       custom_pixel_shader_uniforms, m_current_primitive_type, pipeline_object,
+                       used_textures.m_val);
       }
     }
 
@@ -1058,7 +1060,7 @@ void VertexManagerBase::RenderDrawCall(
     PixelShaderManager& pixel_shader_manager, GeometryShaderManager& geometry_shader_manager,
     const CustomPixelShaderContents& custom_pixel_shader_contents,
     std::span<u8> custom_pixel_shader_uniforms, PrimitiveType primitive_type,
-    const AbstractPipeline* current_pipeline)
+    const AbstractPipeline* current_pipeline, u32 used_textures_mask)
 {
   // Now we can upload uniforms, as nothing else will override them.
   geometry_shader_manager.SetConstants(primitive_type);
@@ -1090,6 +1092,9 @@ void VertexManagerBase::RenderDrawCall(
   if (PerfQueryBase::ShouldEmulate())
     g_perf_query->EnableQuery(bpmem.zcontrol.early_ztest ? PQG_ZCOMP_ZCOMPLOC : PQG_ZCOMP);
 
+  RecordSMGPCDolphinDrawTrace(m_draw_counter + 1, primitive_type, m_index_generator.GetNumVerts(),
+                              m_index_generator.GetIndexLen(), base_vertex, base_index,
+                              used_textures_mask);
   DrawCurrentBatch(base_index, m_index_generator.GetIndexLen(), base_vertex);
 
   // Track the total emulated state draws
