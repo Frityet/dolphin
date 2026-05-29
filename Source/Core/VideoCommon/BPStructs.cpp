@@ -9,8 +9,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <filesystem>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include <fmt/format.h>
+#include <sqlite3.h>
 
 #include "Common/CommonTypes.h"
 #include "Common/EnumMap.h"
@@ -61,6 +63,9 @@ static constexpr Common::EnumMap<float, GammaCorrection::Invalid2_2> s_gammaLUT 
 
 namespace
 {
+constexpr std::string_view SMGPC_TRACE_STORE_SCHEMA = "smgpc-trace-sqlite-v1";
+constexpr std::string_view SMGPC_DOLPHIN_TRACE_SCHEMA = "smgpc-dolphin-parity-trace-v1";
+
 struct SMGPCDolphinCopyTraceEvent
 {
   u64 event_index = 0;
@@ -442,6 +447,33 @@ void WriteJsonString(std::ostream& out, std::string_view value)
   out << '"';
 }
 
+template <typename Callback>
+std::string WriteJsonToString(Callback&& callback)
+{
+  std::ostringstream out;
+  callback(out);
+  return out.str();
+}
+
+std::string UsedTextureSlotsJson(u32 used_textures_mask)
+{
+  return WriteJsonToString([&](std::ostream& out) {
+    out << '[';
+    WriteUsedTextureSlots(out, used_textures_mask);
+    out << ']';
+  });
+}
+
+std::string Float3Json(const std::array<float, 3>& values)
+{
+  return WriteJsonToString([&](std::ostream& out) { WriteFloat3(out, values); });
+}
+
+std::string Color4Json(const std::array<u8, 4>& values)
+{
+  return WriteJsonToString([&](std::ostream& out) { WriteColor4(out, values); });
+}
+
 void WriteTextureBinding(const SMGPCDolphinTextureTraceState& texture, std::ostream& out)
 {
   out << "        {\"slot\": " << texture.slot
@@ -476,13 +508,6 @@ void WriteTextureBinding(const SMGPCDolphinTextureTraceState& texture, std::ostr
       << ", \"identity_name\": ";
   WriteJsonString(out, texture.identity_name);
   out << '}';
-}
-
-void WriteSMGPCTraceRecordPrefix(std::ostream& out, std::string_view record_type, int requested_frame)
-{
-  out << "{\"schema\":\"smgpc-trace-ndjson-v1\",\"record_type\":";
-  WriteJsonString(out, record_type);
-  out << ",\"emulator\":\"dolphin\",\"frame_index\":" << requested_frame;
 }
 
 void WriteSMGPCDolphinDrawTraceEventPayload(std::ostream& out,
@@ -614,34 +639,32 @@ void WriteSMGPCDolphinDrawTraceEventPayload(std::ostream& out,
   out << "]}";
 }
 
-void WriteSMGPCDolphinDrawTraceRecords(std::ostream& out, int requested_frame)
+std::string SMGPCDolphinDrawTraceEventPayloadJson(const SMGPCDolphinDrawTraceEvent& event,
+                                                  std::size_t event_index)
 {
+  return WriteJsonToString(
+      [&](std::ostream& out) { WriteSMGPCDolphinDrawTraceEventPayload(out, event, event_index); });
+}
+
+void WriteSMGPCDolphinDrawTraceArray(std::ostream& out)
+{
+  out << '[';
   for (std::size_t i = 0; i < s_smgpc_dolphin_draw_trace_events.size(); ++i)
   {
+    if (i != 0)
+      out << ", ";
     const auto& event = s_smgpc_dolphin_draw_trace_events[i];
-    WriteSMGPCTraceRecordPrefix(out, "render_packet", requested_frame);
-    out << ",\"record_index\":" << i << ",\"payload\":";
     WriteSMGPCDolphinDrawTraceEventPayload(out, event, i);
-    out << "}\n";
   }
+  out << ']';
 }
 
-void WriteSMGPCDolphinTopLevelRecord(std::ostream& out, int requested_frame, std::string_view key,
-                                     std::string_view payload_json)
+void WriteSMGPCDolphinSemanticEventPayload(std::ostream& out, int requested_frame,
+                                           std::size_t record_index, std::string_view category,
+                                           std::string_view name, std::string_view detail,
+                                           std::string_view source)
 {
-  WriteSMGPCTraceRecordPrefix(out, "top_level", requested_frame);
-  out << ",\"key\":";
-  WriteJsonString(out, key);
-  out << ",\"payload\":" << payload_json << "}\n";
-}
-
-void WriteSMGPCDolphinSemanticEventRecord(std::ostream& out, int requested_frame,
-                                          std::size_t record_index, std::string_view category,
-                                          std::string_view name, std::string_view detail,
-                                          std::string_view source)
-{
-  WriteSMGPCTraceRecordPrefix(out, "semantic_event", requested_frame);
-  out << ",\"record_index\":" << record_index << ",\"payload\":{\"index\":" << record_index
+  out << "{\"index\":" << record_index
       << ",\"frame_index\":" << requested_frame << ",\"category\":";
   WriteJsonString(out, category);
   out << ",\"name\":";
@@ -650,25 +673,46 @@ void WriteSMGPCDolphinSemanticEventRecord(std::ostream& out, int requested_frame
   WriteJsonString(out, detail);
   out << ",\"stage\":\"\",\"source\":";
   WriteJsonString(out, source);
-  out << "}}\n";
+  out << "}";
 }
 
-void WriteSMGPCDolphinSemanticTraceRecords(std::ostream& out, int requested_frame)
+std::string SMGPCDolphinSemanticEventPayloadJson(int requested_frame, std::size_t record_index,
+                                                 std::string_view category, std::string_view name,
+                                                 std::string_view detail, std::string_view source)
+{
+  return WriteJsonToString([&](std::ostream& out) {
+    WriteSMGPCDolphinSemanticEventPayload(out, requested_frame, record_index, category, name,
+                                          detail, source);
+  });
+}
+
+std::size_t SMGPCDolphinSemanticEventCount()
+{
+  return GetSMGPCDolphinSemanticAnchorName().has_value() ? 2U : 1U;
+}
+
+void WriteSMGPCDolphinSemanticTraceArray(std::ostream& out, int requested_frame)
 {
   auto record_index = std::size_t{0};
-  WriteSMGPCDolphinSemanticEventRecord(out, requested_frame, record_index++, "capture",
-                                       "dolphin_trace_requested_frame",
-                                       "requested_frame=" + std::to_string(requested_frame),
-                                       "dolphin_trace");
+  out << '[';
+  WriteSMGPCDolphinSemanticEventPayload(out, requested_frame, record_index++, "capture",
+                                        "dolphin_trace_requested_frame",
+                                        "requested_frame=" + std::to_string(requested_frame),
+                                        "dolphin_trace");
 
   const auto anchor_name = GetSMGPCDolphinSemanticAnchorName();
   if (!anchor_name.has_value())
+  {
+    out << ']';
     return;
+  }
 
-  WriteSMGPCDolphinSemanticEventRecord(out, requested_frame, record_index++,
-                                       GetSMGPCDolphinSemanticAnchorCategory(), *anchor_name,
-                                       GetSMGPCDolphinSemanticAnchorDetail(requested_frame),
-                                       "parity_capture");
+  out << ", ";
+  WriteSMGPCDolphinSemanticEventPayload(out, requested_frame, record_index++,
+                                        GetSMGPCDolphinSemanticAnchorCategory(), *anchor_name,
+                                        GetSMGPCDolphinSemanticAnchorDetail(requested_frame),
+                                        "parity_capture");
+  out << ']';
 }
 
 void WriteSMGPCDolphinCopyEventPayload(std::ostream& out,
@@ -719,19 +763,852 @@ void WriteSMGPCDolphinCopyEventPayload(std::ostream& out,
       << ", \"target_rect\": {\"left\": " << event.target_left
       << ", \"top\": " << event.target_top
       << ", \"right\": " << event.target_right
-      << ", \"bottom\": " << event.target_bottom << "}}";
+      << ", \"bottom\": " << event.target_bottom
+      << ", \"width\": " << (event.target_right - event.target_left)
+      << ", \"height\": " << (event.target_bottom - event.target_top) << "}}";
 }
 
-void WriteSMGPCDolphinCopyTraceRecords(std::ostream& out, int requested_frame)
+std::string SMGPCDolphinCopyEventPayloadJson(const SMGPCDolphinCopyTraceEvent& event,
+                                             std::size_t event_index)
 {
+  return WriteJsonToString(
+      [&](std::ostream& out) { WriteSMGPCDolphinCopyEventPayload(out, event, event_index); });
+}
+
+void WriteSMGPCDolphinCopyTraceArray(std::ostream& out)
+{
+  out << '[';
+  for (std::size_t i = 0; i < s_smgpc_dolphin_copy_trace_events.size(); ++i)
+  {
+    if (i != 0)
+      out << ", ";
+    const auto& event = s_smgpc_dolphin_copy_trace_events[i];
+    WriteSMGPCDolphinCopyEventPayload(out, event, i);
+  }
+  out << ']';
+}
+
+class SMGPCSqliteDatabase
+{
+public:
+  explicit SMGPCSqliteDatabase(const std::string& path)
+  {
+    const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
+    const int rc = sqlite3_open_v2(path.c_str(), &m_database, flags, nullptr);
+    if (rc != SQLITE_OK)
+    {
+      ERROR_LOG_FMT(VIDEO, "SMGPC SQLite trace open failed for {}: {}", path,
+                    m_database ? sqlite3_errmsg(m_database) : sqlite3_errstr(rc));
+      if (m_database)
+      {
+        sqlite3_close(m_database);
+        m_database = nullptr;
+      }
+      return;
+    }
+    sqlite3_busy_timeout(m_database, 5000);
+  }
+
+  ~SMGPCSqliteDatabase()
+  {
+    if (m_database)
+      sqlite3_close(m_database);
+  }
+
+  SMGPCSqliteDatabase(const SMGPCSqliteDatabase&) = delete;
+  SMGPCSqliteDatabase& operator=(const SMGPCSqliteDatabase&) = delete;
+
+  sqlite3* Get() const { return m_database; }
+  explicit operator bool() const { return m_database != nullptr; }
+
+private:
+  sqlite3* m_database = nullptr;
+};
+
+void LogSMGPCSqliteError(sqlite3* database, std::string_view context)
+{
+  ERROR_LOG_FMT(VIDEO, "SMGPC SQLite trace {} failed: {}", context,
+                database ? sqlite3_errmsg(database) : "database is not open");
+}
+
+class SMGPCSqliteStatement
+{
+public:
+  SMGPCSqliteStatement(sqlite3* database, const char* sql, std::string_view context)
+      : m_database(database), m_context(context)
+  {
+    if (sqlite3_prepare_v2(m_database, sql, -1, &m_statement, nullptr) != SQLITE_OK)
+      LogSMGPCSqliteError(m_database, m_context);
+  }
+
+  ~SMGPCSqliteStatement()
+  {
+    if (m_statement)
+      sqlite3_finalize(m_statement);
+  }
+
+  SMGPCSqliteStatement(const SMGPCSqliteStatement&) = delete;
+  SMGPCSqliteStatement& operator=(const SMGPCSqliteStatement&) = delete;
+
+  explicit operator bool() const { return m_statement != nullptr; }
+
+  void BindNull(int column)
+  {
+    if (m_statement)
+      sqlite3_bind_null(m_statement, column);
+  }
+
+  void BindInt(int column, sqlite3_int64 value)
+  {
+    if (m_statement)
+      sqlite3_bind_int64(m_statement, column, value);
+  }
+
+  void BindText(int column, std::string_view value)
+  {
+    if (m_statement)
+      sqlite3_bind_text(m_statement, column, value.data(), static_cast<int>(value.size()),
+                        SQLITE_TRANSIENT);
+  }
+
+  bool StepDone()
+  {
+    if (!m_statement)
+      return false;
+
+    const int rc = sqlite3_step(m_statement);
+    if (rc != SQLITE_DONE)
+    {
+      LogSMGPCSqliteError(m_database, m_context);
+      return false;
+    }
+    sqlite3_reset(m_statement);
+    sqlite3_clear_bindings(m_statement);
+    return true;
+  }
+
+private:
+  sqlite3* m_database = nullptr;
+  sqlite3_stmt* m_statement = nullptr;
+  std::string m_context;
+};
+
+bool ExecuteSMGPCSql(sqlite3* database, const char* sql, std::string_view context)
+{
+  char* error = nullptr;
+  const int rc = sqlite3_exec(database, sql, nullptr, nullptr, &error);
+  if (rc != SQLITE_OK)
+  {
+    ERROR_LOG_FMT(VIDEO, "SMGPC SQLite trace {} failed: {}", context,
+                  error ? error : sqlite3_errmsg(database));
+    sqlite3_free(error);
+    return false;
+  }
+  return true;
+}
+
+bool CreateSMGPCTraceSchema(sqlite3* database)
+{
+  return ExecuteSMGPCSql(database, R"SQL(
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE IF NOT EXISTS traces (
+      id INTEGER PRIMARY KEY,
+      path TEXT NOT NULL UNIQUE,
+      trace_format TEXT NOT NULL,
+      store_schema TEXT NOT NULL,
+      schema_name TEXT,
+      emulator TEXT,
+      requested_frame INTEGER,
+      record_count INTEGER NOT NULL,
+      meta_json TEXT NOT NULL,
+      source_json TEXT NOT NULL,
+      created_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+    CREATE TABLE IF NOT EXISTS trace_sections (
+      trace_id INTEGER NOT NULL REFERENCES traces(id) ON DELETE CASCADE,
+      section_key TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, section_key)
+    );
+    CREATE TABLE IF NOT EXISTS frames (
+      trace_id INTEGER PRIMARY KEY REFERENCES traces(id) ON DELETE CASCADE,
+      frame_index INTEGER,
+      runtime_index INTEGER,
+      presenter_frame_count INTEGER,
+      framebuffer_width INTEGER,
+      framebuffer_height INTEGER,
+      viewport_json TEXT,
+      scissor_json TEXT
+    );
+    CREATE TABLE IF NOT EXISTS render_packets (
+      trace_id INTEGER NOT NULL REFERENCES traces(id) ON DELETE CASCADE,
+      packet_index INTEGER NOT NULL,
+      draw_index INTEGER,
+      frame_index INTEGER,
+      presenter_frame_count INTEGER,
+      model_name TEXT,
+      material_name TEXT,
+      layout_name TEXT,
+      render_pass TEXT,
+      draw_pass TEXT,
+      view_id INTEGER,
+      packet_mode TEXT,
+      primitive_type TEXT,
+      vertex_count INTEGER,
+      index_count INTEGER,
+      source_vertex_count INTEGER,
+      source_triangle_count INTEGER,
+      texgen_count INTEGER,
+      color_channel_count INTEGER,
+      tev_stage_count INTEGER,
+      indirect_stage_count INTEGER,
+      cull_mode TEXT,
+      used_textures_mask INTEGER,
+      used_texture_slots_json TEXT,
+      requested_light_mask INTEGER,
+      loaded_light_mask INTEGER,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, packet_index)
+    );
+    CREATE TABLE IF NOT EXISTS packet_texture_bindings (
+      trace_id INTEGER NOT NULL,
+      packet_index INTEGER NOT NULL,
+      binding_index INTEGER NOT NULL,
+      slot INTEGER,
+      texture_index INTEGER,
+      name TEXT,
+      identity_name TEXT,
+      address INTEGER,
+      width INTEGER,
+      height INTEGER,
+      format TEXT,
+      format_raw INTEGER,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, packet_index, binding_index)
+    );
+    CREATE TABLE IF NOT EXISTS packet_tev_orders (
+      trace_id INTEGER NOT NULL,
+      packet_index INTEGER NOT NULL,
+      order_index INTEGER NOT NULL,
+      stage INTEGER,
+      tex_coord INTEGER,
+      tex_map INTEGER,
+      color_channel INTEGER,
+      texture_enabled INTEGER,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, packet_index, order_index)
+    );
+    CREATE TABLE IF NOT EXISTS packet_tev_stages (
+      trace_id INTEGER NOT NULL,
+      packet_index INTEGER NOT NULL,
+      stage_index INTEGER NOT NULL,
+      stage INTEGER,
+      color_raw INTEGER,
+      alpha_raw INTEGER,
+      color_in_json TEXT,
+      alpha_in_json TEXT,
+      k_color_sel INTEGER,
+      k_alpha_sel INTEGER,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, packet_index, stage_index)
+    );
+    CREATE TABLE IF NOT EXISTS packet_lights (
+      trace_id INTEGER NOT NULL,
+      packet_index INTEGER NOT NULL,
+      light_row INTEGER NOT NULL,
+      light_index INTEGER,
+      color_json TEXT,
+      position_json TEXT,
+      direction_json TEXT,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, packet_index, light_row)
+    );
+    CREATE TABLE IF NOT EXISTS copy_events (
+      trace_id INTEGER NOT NULL REFERENCES traces(id) ON DELETE CASCADE,
+      row_index INTEGER NOT NULL,
+      event_index INTEGER,
+      presenter_frame_count INTEGER,
+      kind TEXT,
+      source_width INTEGER,
+      source_height INTEGER,
+      output_width INTEGER,
+      output_height INTEGER,
+      target_width INTEGER,
+      target_height INTEGER,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, row_index)
+    );
+    CREATE TABLE IF NOT EXISTS semantic_events (
+      trace_id INTEGER NOT NULL REFERENCES traces(id) ON DELETE CASCADE,
+      row_index INTEGER NOT NULL,
+      event_index INTEGER,
+      frame_index INTEGER,
+      category TEXT,
+      name TEXT,
+      detail TEXT,
+      stage TEXT,
+      source TEXT,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, row_index)
+    );
+    CREATE TABLE IF NOT EXISTS layout_runtime (
+      trace_id INTEGER NOT NULL REFERENCES traces(id) ON DELETE CASCADE,
+      row_index INTEGER NOT NULL,
+      layout_index INTEGER,
+      name TEXT,
+      layout_name TEXT,
+      archive_path TEXT,
+      movement_type INTEGER,
+      calc_anim_type INTEGER,
+      draw_type INTEGER,
+      order_index INTEGER,
+      dead INTEGER,
+      suspended INTEGER,
+      pane_count INTEGER,
+      picture_count INTEGER,
+      text_box_count INTEGER,
+      material_count INTEGER,
+      texture_count INTEGER,
+      font_count INTEGER,
+      animation_count INTEGER,
+      committed_pane_frame_count INTEGER,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, row_index)
+    );
+    CREATE TABLE IF NOT EXISTS layout_runtime_panes (
+      trace_id INTEGER NOT NULL REFERENCES traces(id) ON DELETE CASCADE,
+      layout_row INTEGER NOT NULL,
+      pane_index INTEGER NOT NULL,
+      name TEXT,
+      parent_index INTEGER,
+      base_visible INTEGER,
+      effective_visible INTEGER,
+      alpha INTEGER,
+      width INTEGER,
+      height INTEGER,
+      content_count INTEGER,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, layout_row, pane_index)
+    );
+    CREATE TABLE IF NOT EXISTS layout_runtime_pane_contents (
+      trace_id INTEGER NOT NULL REFERENCES traces(id) ON DELETE CASCADE,
+      layout_row INTEGER NOT NULL,
+      pane_index INTEGER NOT NULL,
+      content_index INTEGER NOT NULL,
+      kind TEXT,
+      material_index INTEGER,
+      material_name TEXT,
+      texture_name TEXT,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, layout_row, pane_index, content_index)
+    );
+    CREATE TABLE IF NOT EXISTS layout_runtime_materials (
+      trace_id INTEGER NOT NULL REFERENCES traces(id) ON DELETE CASCADE,
+      layout_row INTEGER NOT NULL,
+      material_index INTEGER NOT NULL,
+      name TEXT,
+      texture_count INTEGER,
+      tex_coord_gen_count INTEGER,
+      tev_stage_count INTEGER,
+      alpha_compare_enabled INTEGER,
+      blend_enabled INTEGER,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, layout_row, material_index)
+    );
+    CREATE TABLE IF NOT EXISTS layout_runtime_material_textures (
+      trace_id INTEGER NOT NULL REFERENCES traces(id) ON DELETE CASCADE,
+      layout_row INTEGER NOT NULL,
+      material_index INTEGER NOT NULL,
+      texture_slot_index INTEGER NOT NULL,
+      slot INTEGER,
+      texture_index INTEGER,
+      texture_name TEXT,
+      wrap_s INTEGER,
+      wrap_t INTEGER,
+      min_filter INTEGER,
+      mag_filter INTEGER,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, layout_row, material_index, texture_slot_index)
+    );
+    CREATE TABLE IF NOT EXISTS layout_runtime_textures (
+      trace_id INTEGER NOT NULL REFERENCES traces(id) ON DELETE CASCADE,
+      layout_row INTEGER NOT NULL,
+      texture_index INTEGER NOT NULL,
+      name TEXT,
+      width INTEGER,
+      height INTEGER,
+      format TEXT,
+      format_raw INTEGER,
+      uploaded INTEGER,
+      rgba_byte_count INTEGER,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(trace_id, layout_row, texture_index)
+    );
+    CREATE INDEX IF NOT EXISTS idx_traces_emulator_frame ON traces(emulator, requested_frame);
+    CREATE INDEX IF NOT EXISTS idx_trace_sections_key ON trace_sections(section_key);
+    CREATE INDEX IF NOT EXISTS idx_render_packets_material ON render_packets(material_name);
+    CREATE INDEX IF NOT EXISTS idx_render_packets_layout ON render_packets(layout_name);
+    CREATE INDEX IF NOT EXISTS idx_render_packets_signature ON render_packets(texgen_count, color_channel_count, tev_stage_count, indirect_stage_count, cull_mode, vertex_count);
+    CREATE INDEX IF NOT EXISTS idx_texture_bindings_signature ON packet_texture_bindings(slot, format, width, height);
+    CREATE INDEX IF NOT EXISTS idx_semantic_events_name ON semantic_events(category, name, frame_index);
+    CREATE INDEX IF NOT EXISTS idx_layout_runtime_name ON layout_runtime(name, layout_name, dead, suspended);
+    CREATE INDEX IF NOT EXISTS idx_layout_runtime_panes_name ON layout_runtime_panes(name, effective_visible);
+    CREATE INDEX IF NOT EXISTS idx_layout_runtime_materials_name ON layout_runtime_materials(name);
+    CREATE INDEX IF NOT EXISTS idx_layout_runtime_textures_name ON layout_runtime_textures(name, format, width, height);
+    CREATE VIEW IF NOT EXISTS packet_signatures AS
+      SELECT
+        rp.trace_id,
+        rp.packet_index,
+        rp.model_name,
+        rp.material_name,
+        rp.layout_name,
+        rp.render_pass,
+        rp.packet_mode,
+        rp.texgen_count,
+        rp.color_channel_count,
+        rp.tev_stage_count,
+        rp.indirect_stage_count,
+        rp.cull_mode,
+        rp.vertex_count,
+        rp.requested_light_mask,
+        group_concat(ptb.slot || ':' || coalesce(ptb.format, '') || ':' || coalesce(ptb.width, '') || 'x' || coalesce(ptb.height, ''), '|') AS texture_signature
+      FROM render_packets rp
+      LEFT JOIN packet_texture_bindings ptb ON ptb.trace_id = rp.trace_id AND ptb.packet_index = rp.packet_index
+      GROUP BY rp.trace_id, rp.packet_index;
+    CREATE VIEW IF NOT EXISTS trace_overview AS
+      SELECT
+        t.id AS trace_id,
+        t.path,
+        t.store_schema,
+        t.schema_name,
+        t.emulator,
+        t.requested_frame,
+        f.frame_index,
+        f.framebuffer_width,
+        f.framebuffer_height,
+        t.record_count,
+        (SELECT count(*) FROM render_packets rp WHERE rp.trace_id = t.id) AS render_packet_count,
+        (SELECT count(*) FROM copy_events ce WHERE ce.trace_id = t.id) AS copy_event_count,
+        (SELECT count(*) FROM semantic_events se WHERE se.trace_id = t.id) AS semantic_event_count,
+        (SELECT count(*) FROM layout_runtime lr WHERE lr.trace_id = t.id) AS layout_runtime_count
+      FROM traces t
+      LEFT JOIN frames f ON f.trace_id = t.id;
+    CREATE VIEW IF NOT EXISTS material_usage AS
+      SELECT trace_id, coalesce(material_name, '<null>') AS material_name, count(*) AS packet_count
+      FROM render_packets
+      GROUP BY trace_id, material_name;
+    CREATE VIEW IF NOT EXISTS layout_usage AS
+      SELECT trace_id, coalesce(layout_name, '<null>') AS layout_name, count(*) AS packet_count
+      FROM render_packets
+      GROUP BY trace_id, layout_name;
+    CREATE VIEW IF NOT EXISTS texture_usage AS
+      SELECT trace_id, coalesce(name, identity_name, '<null>') AS texture_name, coalesce(format, '<null>') AS format,
+             width, height, count(*) AS binding_count
+      FROM packet_texture_bindings
+      GROUP BY trace_id, texture_name, format, width, height;
+    CREATE VIEW IF NOT EXISTS copy_kind_counts AS
+      SELECT trace_id, coalesce(kind, '<null>') AS kind, count(*) AS copy_count
+      FROM copy_events
+      GROUP BY trace_id, kind;
+    CREATE VIEW IF NOT EXISTS semantic_anchor_counts AS
+      SELECT trace_id, coalesce(category, '<null>') AS category, coalesce(name, '<null>') AS name,
+             min(frame_index) AS first_frame_index, count(*) AS event_count
+      FROM semantic_events
+      GROUP BY trace_id, category, name;
+  )SQL",
+                         "schema creation");
+}
+
+std::string BuildSMGPCDolphinTraceJson(int requested_frame, int window)
+{
+  return WriteJsonToString([&](std::ostream& out) {
+    const auto current_frame = g_presenter ? g_presenter->FrameCount() : 0;
+    out << "{\"schema\":";
+    WriteJsonString(out, SMGPC_DOLPHIN_TRACE_SCHEMA);
+    out << ",\"store_schema\":";
+    WriteJsonString(out, SMGPC_TRACE_STORE_SCHEMA);
+    out << ",\"emulator\":\"dolphin\",\"requested_frame\":" << requested_frame
+        << ",\"trace_window\":" << window << ",\"frame\":{\"index\":" << requested_frame
+        << ",\"dolphin_presenter_frame_count\":" << current_frame
+        << ",\"framebuffer\":{\"width\":" << (g_presenter ? g_presenter->GetBackbufferWidth() : 0)
+        << ",\"height\":" << (g_presenter ? g_presenter->GetBackbufferHeight() : 0)
+        << "}},\"camera_pose\":null,\"scene_snapshot\":[],\"scene_trace\":[],\"layout_runtime\":[],\"semantic_events\":";
+    WriteSMGPCDolphinSemanticTraceArray(out, requested_frame);
+    out << ",\"render_packets\":";
+    WriteSMGPCDolphinDrawTraceArray(out);
+    out << ",\"copy_events\":";
+    WriteSMGPCDolphinCopyTraceArray(out);
+    out << '}';
+  });
+}
+
+std::string BuildSMGPCDolphinTraceMetaJson(int requested_frame, int window)
+{
+  return WriteJsonToString([&](std::ostream& out) {
+    out << "{\"store_schema\":";
+    WriteJsonString(out, SMGPC_TRACE_STORE_SCHEMA);
+    out << ",\"source_schema\":";
+    WriteJsonString(out, SMGPC_DOLPHIN_TRACE_SCHEMA);
+    out << ",\"emulator\":\"dolphin\",\"requested_frame\":" << requested_frame
+        << ",\"trace_window\":" << window << '}';
+  });
+}
+
+sqlite3_int64 SMGPCDolphinTraceRecordCount()
+{
+  return static_cast<sqlite3_int64>(5U + SMGPCDolphinSemanticEventCount() +
+                                    s_smgpc_dolphin_draw_trace_events.size() +
+                                    s_smgpc_dolphin_copy_trace_events.size());
+}
+
+bool InsertSMGPCTraceSections(sqlite3* database, sqlite3_int64 trace_id)
+{
+  auto insert = SMGPCSqliteStatement(database, R"SQL(
+    INSERT INTO trace_sections(trace_id, section_key, payload_json)
+    VALUES(?, ?, ?)
+  )SQL",
+                                     "trace section insert");
+  if (!insert)
+    return false;
+
+  bool ok = true;
+  for (const auto* key : {"scene_snapshot", "scene_trace", "layout_runtime"})
+  {
+    insert.BindInt(1, trace_id);
+    insert.BindText(2, key);
+    insert.BindText(3, "[]");
+    ok = insert.StepDone() && ok;
+  }
+  return ok;
+}
+
+bool InsertSMGPCFrame(sqlite3* database, sqlite3_int64 trace_id, int requested_frame)
+{
+  auto insert = SMGPCSqliteStatement(database, R"SQL(
+    INSERT INTO frames(
+      trace_id, frame_index, runtime_index, presenter_frame_count, framebuffer_width, framebuffer_height, viewport_json, scissor_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  )SQL",
+                                     "frame insert");
+  if (!insert)
+    return false;
+
+  insert.BindInt(1, trace_id);
+  insert.BindInt(2, requested_frame);
+  insert.BindNull(3);
+  insert.BindInt(4, g_presenter ? g_presenter->FrameCount() : 0);
+  insert.BindInt(5, g_presenter ? g_presenter->GetBackbufferWidth() : 0);
+  insert.BindInt(6, g_presenter ? g_presenter->GetBackbufferHeight() : 0);
+  insert.BindNull(7);
+  insert.BindNull(8);
+  return insert.StepDone();
+}
+
+bool InsertSMGPCPacketChildren(sqlite3* database, sqlite3_int64 trace_id, sqlite3_int64 packet_index,
+                               const SMGPCDolphinDrawTraceEvent& event)
+{
+  bool ok = true;
+  auto insert_texture = SMGPCSqliteStatement(database, R"SQL(
+    INSERT INTO packet_texture_bindings(
+      trace_id, packet_index, binding_index, slot, texture_index, name, identity_name, address, width, height, format, format_raw, payload_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  )SQL",
+                                             "packet texture binding insert");
+  if (!insert_texture)
+    return false;
+
+  auto binding_index = sqlite3_int64{0};
+  for (const auto& texture : event.textures)
+  {
+    if (!texture.active)
+      continue;
+
+    const auto payload = WriteJsonToString(
+        [&](std::ostream& out) { WriteTextureBinding(texture, out); });
+    insert_texture.BindInt(1, trace_id);
+    insert_texture.BindInt(2, packet_index);
+    insert_texture.BindInt(3, binding_index++);
+    insert_texture.BindInt(4, texture.slot);
+    insert_texture.BindNull(5);
+    insert_texture.BindNull(6);
+    insert_texture.BindText(7, texture.identity_name);
+    insert_texture.BindInt(8, texture.address);
+    insert_texture.BindInt(9, texture.width);
+    insert_texture.BindInt(10, texture.height);
+    insert_texture.BindText(11, texture.texture_format_name);
+    insert_texture.BindInt(12, texture.texture_format);
+    insert_texture.BindText(13, payload);
+    ok = insert_texture.StepDone() && ok;
+  }
+
+  auto insert_order = SMGPCSqliteStatement(database, R"SQL(
+    INSERT INTO packet_tev_orders(
+      trace_id, packet_index, order_index, stage, tex_coord, tex_map, color_channel, texture_enabled, payload_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  )SQL",
+                                           "packet TEV order insert");
+  auto insert_stage = SMGPCSqliteStatement(database, R"SQL(
+    INSERT INTO packet_tev_stages(
+      trace_id, packet_index, stage_index, stage, color_raw, alpha_raw, color_in_json, alpha_in_json, k_color_sel, k_alpha_sel, payload_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  )SQL",
+                                           "packet TEV stage insert");
+  if (!insert_order || !insert_stage)
+    return false;
+
+  const auto tev_stage_count = std::min<std::size_t>(event.tev_stage_count, 16);
+  for (std::size_t stage = 0; stage < tev_stage_count; ++stage)
+  {
+    const auto& order = event.tev_orders[stage];
+    const auto order_payload = WriteJsonToString([&](std::ostream& out) {
+      out << "{\"stage\": " << order.stage
+          << ", \"texture_enabled\": " << BoolJson(order.texture_enabled)
+          << ", \"tex_coord\": " << order.tex_coord
+          << ", \"tex_map\": " << order.tex_map
+          << ", \"color_channel\": " << order.color_channel << "}";
+    });
+    insert_order.BindInt(1, trace_id);
+    insert_order.BindInt(2, packet_index);
+    insert_order.BindInt(3, static_cast<sqlite3_int64>(stage));
+    insert_order.BindInt(4, order.stage);
+    insert_order.BindInt(5, order.tex_coord);
+    insert_order.BindInt(6, order.tex_map);
+    insert_order.BindInt(7, order.color_channel);
+    insert_order.BindInt(8, order.texture_enabled ? 1 : 0);
+    insert_order.BindText(9, order_payload);
+    ok = insert_order.StepDone() && ok;
+
+    const auto& tev_stage = event.tev_stages[stage];
+    const auto stage_payload = WriteJsonToString([&](std::ostream& out) {
+      out << "{\"stage\": " << tev_stage.stage
+          << ", \"color_raw\": " << tev_stage.color_raw
+          << ", \"alpha_raw\": " << tev_stage.alpha_raw << "}";
+    });
+    insert_stage.BindInt(1, trace_id);
+    insert_stage.BindInt(2, packet_index);
+    insert_stage.BindInt(3, static_cast<sqlite3_int64>(stage));
+    insert_stage.BindInt(4, tev_stage.stage);
+    insert_stage.BindInt(5, tev_stage.color_raw);
+    insert_stage.BindInt(6, tev_stage.alpha_raw);
+    insert_stage.BindNull(7);
+    insert_stage.BindNull(8);
+    insert_stage.BindNull(9);
+    insert_stage.BindNull(10);
+    insert_stage.BindText(11, stage_payload);
+    ok = insert_stage.StepDone() && ok;
+  }
+
+  auto insert_light = SMGPCSqliteStatement(database, R"SQL(
+    INSERT INTO packet_lights(
+      trace_id, packet_index, light_row, light_index, color_json, position_json, direction_json, payload_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  )SQL",
+                                           "packet light insert");
+  if (!insert_light)
+    return false;
+
+  auto light_row = sqlite3_int64{0};
+  for (const auto& light : event.lights)
+  {
+    if (!light.active)
+      continue;
+
+    const auto color = Color4Json(light.color_rgba);
+    const auto position = Float3Json(light.position);
+    const auto direction = Float3Json(light.direction);
+    const auto payload = WriteJsonToString([&](std::ostream& out) {
+      out << "{\"index\": " << light.index << ", \"color\": " << color
+          << ", \"color_abgr\": " << Color4Json(light.color_abgr)
+          << ", \"cosine_attenuation\": " << Float3Json(light.cosine_attenuation)
+          << ", \"distance_attenuation\": " << Float3Json(light.distance_attenuation)
+          << ", \"position\": " << position << ", \"direction\": " << direction << "}";
+    });
+    insert_light.BindInt(1, trace_id);
+    insert_light.BindInt(2, packet_index);
+    insert_light.BindInt(3, light_row++);
+    insert_light.BindInt(4, light.index);
+    insert_light.BindText(5, color);
+    insert_light.BindText(6, position);
+    insert_light.BindText(7, direction);
+    insert_light.BindText(8, payload);
+    ok = insert_light.StepDone() && ok;
+  }
+
+  return ok;
+}
+
+bool InsertSMGPCRenderPackets(sqlite3* database, sqlite3_int64 trace_id)
+{
+  auto insert = SMGPCSqliteStatement(database, R"SQL(
+    INSERT INTO render_packets(
+      trace_id, packet_index, draw_index, frame_index, presenter_frame_count, model_name, material_name, layout_name, render_pass, draw_pass, view_id,
+      packet_mode, primitive_type, vertex_count, index_count, source_vertex_count, source_triangle_count, texgen_count,
+      color_channel_count, tev_stage_count, indirect_stage_count, cull_mode, used_textures_mask, used_texture_slots_json,
+      requested_light_mask, loaded_light_mask, payload_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  )SQL",
+                                    "render packet insert");
+  if (!insert)
+    return false;
+
+  bool ok = true;
+  for (std::size_t i = 0; i < s_smgpc_dolphin_draw_trace_events.size(); ++i)
+  {
+    const auto& event = s_smgpc_dolphin_draw_trace_events[i];
+    const auto packet_index = static_cast<sqlite3_int64>(i);
+    const auto payload = SMGPCDolphinDrawTraceEventPayloadJson(event, i);
+    const auto slots = UsedTextureSlotsJson(event.used_textures_mask);
+    const auto cull_mode = std::to_string(event.cull_mode);
+
+    insert.BindInt(1, trace_id);
+    insert.BindInt(2, packet_index);
+    insert.BindInt(3, event.draw_index);
+    insert.BindInt(4, event.presenter_frame_count);
+    insert.BindInt(5, event.presenter_frame_count);
+    insert.BindNull(6);
+    insert.BindNull(7);
+    insert.BindNull(8);
+    insert.BindText(9, "GXDraw");
+    insert.BindNull(10);
+    insert.BindInt(11, 0);
+    insert.BindNull(12);
+    insert.BindText(13, PrimitiveTypeName(event.primitive_type));
+    insert.BindInt(14, event.num_vertices);
+    insert.BindInt(15, event.num_indices);
+    insert.BindNull(16);
+    insert.BindNull(17);
+    insert.BindInt(18, event.texgen_count);
+    insert.BindInt(19, event.color_channel_count);
+    insert.BindInt(20, event.tev_stage_count);
+    insert.BindInt(21, event.indirect_stage_count);
+    insert.BindText(22, cull_mode);
+    insert.BindInt(23, event.used_textures_mask);
+    insert.BindText(24, slots);
+    insert.BindInt(25, event.requested_light_mask);
+    insert.BindInt(26, event.loaded_light_mask);
+    insert.BindText(27, payload);
+    ok = insert.StepDone() && ok;
+    ok = InsertSMGPCPacketChildren(database, trace_id, packet_index, event) && ok;
+  }
+  return ok;
+}
+
+bool InsertSMGPCCopyEvents(sqlite3* database, sqlite3_int64 trace_id)
+{
+  auto insert = SMGPCSqliteStatement(database, R"SQL(
+    INSERT INTO copy_events(
+      trace_id, row_index, event_index, presenter_frame_count, kind, source_width, source_height, output_width, output_height,
+      target_width, target_height, payload_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  )SQL",
+                                    "copy event insert");
+  if (!insert)
+    return false;
+
+  bool ok = true;
   for (std::size_t i = 0; i < s_smgpc_dolphin_copy_trace_events.size(); ++i)
   {
     const auto& event = s_smgpc_dolphin_copy_trace_events[i];
-    WriteSMGPCTraceRecordPrefix(out, "copy_event", requested_frame);
-    out << ",\"record_index\":" << i << ",\"payload\":";
-    WriteSMGPCDolphinCopyEventPayload(out, event, i);
-    out << "}\n";
+    const auto payload = SMGPCDolphinCopyEventPayloadJson(event, i);
+    insert.BindInt(1, trace_id);
+    insert.BindInt(2, static_cast<sqlite3_int64>(i));
+    insert.BindInt(3, event.event_index);
+    insert.BindInt(4, event.presenter_frame_count);
+    insert.BindText(5, event.copy_to_xfb ? "xfb" : "texture");
+    insert.BindInt(6, event.copy_width);
+    insert.BindInt(7, event.copy_height);
+    insert.BindInt(8, event.output_width);
+    insert.BindInt(9, event.output_height);
+    insert.BindInt(10, event.target_right - event.target_left);
+    insert.BindInt(11, event.target_bottom - event.target_top);
+    insert.BindText(12, payload);
+    ok = insert.StepDone() && ok;
   }
+  return ok;
+}
+
+bool InsertSMGPCSemanticEvent(sqlite3* database, sqlite3_int64 trace_id, std::size_t row,
+                              int requested_frame, std::string_view category,
+                              std::string_view name, std::string_view detail,
+                              std::string_view source)
+{
+  auto insert = SMGPCSqliteStatement(database, R"SQL(
+    INSERT INTO semantic_events(
+      trace_id, row_index, event_index, frame_index, category, name, detail, stage, source, payload_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  )SQL",
+                                    "semantic event insert");
+  if (!insert)
+    return false;
+
+  const auto payload =
+      SMGPCDolphinSemanticEventPayloadJson(requested_frame, row, category, name, detail, source);
+  insert.BindInt(1, trace_id);
+  insert.BindInt(2, static_cast<sqlite3_int64>(row));
+  insert.BindInt(3, static_cast<sqlite3_int64>(row));
+  insert.BindInt(4, requested_frame);
+  insert.BindText(5, category);
+  insert.BindText(6, name);
+  insert.BindText(7, detail);
+  insert.BindText(8, "");
+  insert.BindText(9, source);
+  insert.BindText(10, payload);
+  return insert.StepDone();
+}
+
+bool InsertSMGPCSemanticEvents(sqlite3* database, sqlite3_int64 trace_id, int requested_frame)
+{
+  auto row = std::size_t{0};
+  bool ok = InsertSMGPCSemanticEvent(database, trace_id, row++, requested_frame, "capture",
+                                     "dolphin_trace_requested_frame",
+                                     "requested_frame=" + std::to_string(requested_frame),
+                                     "dolphin_trace");
+
+  const auto anchor_name = GetSMGPCDolphinSemanticAnchorName();
+  if (!anchor_name.has_value())
+    return ok;
+
+  ok = InsertSMGPCSemanticEvent(database, trace_id, row++, requested_frame,
+                                GetSMGPCDolphinSemanticAnchorCategory(), *anchor_name,
+                                GetSMGPCDolphinSemanticAnchorDetail(requested_frame),
+                                "parity_capture") &&
+       ok;
+  return ok;
+}
+
+bool InsertSMGPCTrace(sqlite3* database, const std::string& path, int requested_frame, int window,
+                      const std::string& source_json)
+{
+  auto insert = SMGPCSqliteStatement(database, R"SQL(
+    INSERT INTO traces(path, trace_format, store_schema, schema_name, emulator, requested_frame, record_count, meta_json, source_json)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+  )SQL",
+                                    "trace insert");
+  if (!insert)
+    return false;
+
+  const auto absolute_path = std::filesystem::absolute(path).string();
+  const auto meta_json = BuildSMGPCDolphinTraceMetaJson(requested_frame, window);
+  insert.BindText(1, absolute_path);
+  insert.BindText(2, "sqlite");
+  insert.BindText(3, SMGPC_TRACE_STORE_SCHEMA);
+  insert.BindText(4, SMGPC_DOLPHIN_TRACE_SCHEMA);
+  insert.BindText(5, "dolphin");
+  insert.BindInt(6, requested_frame);
+  insert.BindInt(7, SMGPCDolphinTraceRecordCount());
+  insert.BindText(8, meta_json);
+  insert.BindText(9, source_json);
+  if (!insert.StepDone())
+    return false;
+
+  const auto trace_id = sqlite3_last_insert_rowid(database);
+  bool ok = true;
+  ok = InsertSMGPCTraceSections(database, trace_id) && ok;
+  ok = InsertSMGPCFrame(database, trace_id, requested_frame) && ok;
+  ok = InsertSMGPCRenderPackets(database, trace_id) && ok;
+  ok = InsertSMGPCCopyEvents(database, trace_id) && ok;
+  ok = InsertSMGPCSemanticEvents(database, trace_id, requested_frame) && ok;
+  return ok;
 }
 
 void WriteSMGPCDolphinCopyTrace(const std::string& path, int requested_frame, int window)
@@ -739,26 +1616,22 @@ void WriteSMGPCDolphinCopyTrace(const std::string& path, int requested_frame, in
   if (!File::CreateFullPath(path))
     return;
 
-  std::ofstream out(path);
-  if (!out)
+  File::Delete(path, File::IfAbsentBehavior::NoConsoleWarning);
+  auto database = SMGPCSqliteDatabase(path);
+  if (!database)
     return;
 
-  const auto current_frame = g_presenter ? g_presenter->FrameCount() : 0;
-  WriteSMGPCTraceRecordPrefix(out, "trace_meta", requested_frame);
-  out << ",\"payload\":{\"source_schema\":\"smgpc-dolphin-parity-trace-v1\",\"emulator\":\"dolphin\",\"requested_frame\":"
-      << requested_frame << ",\"trace_window\":" << window << "}}\n";
-  WriteSMGPCTraceRecordPrefix(out, "frame", requested_frame);
-  out << ",\"payload\":{\"index\":" << requested_frame
-      << ",\"dolphin_presenter_frame_count\":" << current_frame
-      << ",\"framebuffer\":{\"width\":" << (g_presenter ? g_presenter->GetBackbufferWidth() : 0)
-      << ",\"height\":" << (g_presenter ? g_presenter->GetBackbufferHeight() : 0) << "}}}\n";
-  WriteSMGPCDolphinTopLevelRecord(out, requested_frame, "camera_pose", "null");
-  WriteSMGPCDolphinTopLevelRecord(out, requested_frame, "scene_snapshot", "[]");
-  WriteSMGPCDolphinTopLevelRecord(out, requested_frame, "scene_trace", "[]");
-  WriteSMGPCDolphinTopLevelRecord(out, requested_frame, "layout_runtime", "[]");
-  WriteSMGPCDolphinSemanticTraceRecords(out, requested_frame);
-  WriteSMGPCDolphinDrawTraceRecords(out, requested_frame);
-  WriteSMGPCDolphinCopyTraceRecords(out, requested_frame);
+  const auto source_json = BuildSMGPCDolphinTraceJson(requested_frame, window);
+  if (!CreateSMGPCTraceSchema(database.Get()))
+    return;
+  if (!ExecuteSMGPCSql(database.Get(), "BEGIN IMMEDIATE TRANSACTION", "begin transaction"))
+    return;
+  if (!InsertSMGPCTrace(database.Get(), path, requested_frame, window, source_json))
+  {
+    ExecuteSMGPCSql(database.Get(), "ROLLBACK", "rollback transaction");
+    return;
+  }
+  ExecuteSMGPCSql(database.Get(), "COMMIT", "commit transaction");
 }
 
 void RecordSMGPCDolphinCopyTrace(bool copy_to_xfb, const MathUtil::Rectangle<s32>& src_rect,

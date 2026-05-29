@@ -1,3 +1,5 @@
+set(SMGPC_SQLITE3_SOURCE ../../../Externals/mGBA/mgba/src/third-party/sqlite3/sqlite3.c)
+
 add_library(videocommon
   AbstractFramebuffer.cpp
   AbstractFramebuffer.h
@@ -234,6 +236,18 @@ add_library(videocommon
   XFStateManager.h
   XFStructs.cpp
   XFStructs.h
+  ${SMGPC_SQLITE3_SOURCE}
+)
+
+if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+  set_source_files_properties(${SMGPC_SQLITE3_SOURCE} PROPERTIES
+    COMPILE_OPTIONS "-Wno-missing-variable-declarations;-Wno-implicit-const-int-float-conversion"
+  )
+endif()
+
+target_include_directories(videocommon
+PRIVATE
+  ../../../Externals/mGBA/mgba/src/third-party/sqlite3
 )
 
 target_link_libraries(videocommon
