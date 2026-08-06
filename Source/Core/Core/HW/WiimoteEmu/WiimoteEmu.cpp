@@ -37,6 +37,7 @@
 #include "Core/HW/WiimoteEmu/Extension/TaTaCon.h"
 #include "Core/HW/WiimoteEmu/Extension/Turntable.h"
 #include "Core/HW/WiimoteEmu/Extension/UDrawTablet.h"
+#include "Core/HW/WiimoteEmu/ScriptedInput.h"
 
 #include "InputCommon/ControllerEmu/ControlGroup/Attachments.h"
 #include "InputCommon/ControllerEmu/ControlGroup/Buttons.h"
@@ -310,6 +311,9 @@ Wiimote::Wiimote(const unsigned int index) : m_index(index), m_bt_device_index(i
                         {SIDEWAYS_OPTION, nullptr, nullptr, _trans("Sideways Wii Remote")}, false);
 
   Reset();
+
+  if (auto scripted_input = CreateScriptedInputOverride(m_index))
+    SetInputOverrideFunction(std::move(scripted_input));
 
   m_config_changed_callback_id = Config::AddConfigChangedCallback([this] { RefreshConfig(); });
   RefreshConfig();

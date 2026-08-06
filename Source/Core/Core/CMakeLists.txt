@@ -360,6 +360,8 @@ add_library(core
   HW/WiimoteEmu/I2CBus.h
   HW/WiimoteEmu/MotionPlus.cpp
   HW/WiimoteEmu/MotionPlus.h
+  HW/WiimoteEmu/ScriptedInput.cpp
+  HW/WiimoteEmu/ScriptedInput.h
   HW/WiimoteEmu/Speaker.cpp
   HW/WiimoteEmu/Speaker.h
   HW/WiimoteEmu/WiimoteEmu.cpp

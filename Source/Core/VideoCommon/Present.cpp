@@ -8,6 +8,7 @@
 #include "Core/Config/MainSettings.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/VideoInterface.h"
+#include "Core/HW/WiimoteEmu/ScriptedInput.h"
 #include "Core/Host.h"
 #include "Core/System.h"
 
@@ -187,6 +188,8 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
     present_info.reason = PresentInfo::PresentReason::VideoInterface;
   }
 
+  WiimoteEmu::SetScriptedInputFrame(m_frame_count);
+
   if (m_xfb_entry)
   {
     // With no references, this XFB copy wasn't stitched together
@@ -238,6 +241,8 @@ void Presenter::ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_
       .emulated_timestamp = ticks,
       .intended_present_time = m_next_swap_estimated_time,
   };
+
+  WiimoteEmu::SetScriptedInputFrame(m_frame_count);
 
   auto& video_events = GetVideoEvents();
 
