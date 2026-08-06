@@ -3,13 +3,21 @@
 
 #include "VideoCommon/Present.h"
 
+#include <atomic>
+#include <charconv>
+#include <cstdlib>
+#include <optional>
+#include <string_view>
+
 #include "Common/ChunkFile.h"
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/VideoInterface.h"
 #include "Core/HW/WiimoteEmu/ScriptedInput.h"
 #include "Core/Host.h"
+#include "Core/State.h"
 #include "Core/System.h"
 
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
@@ -29,6 +37,50 @@ std::unique_ptr<VideoCommon::Presenter> g_presenter;
 
 namespace VideoCommon
 {
+namespace
+{
+std::optional<int> GetSMGPCSaveStateFrame()
+{
+  const char* value = std::getenv("SMGPC_DOLPHIN_SAVE_STATE_FRAME");
+  if (value == nullptr || value[0] == '\0')
+    return std::nullopt;
+
+  const auto text = std::string_view(value);
+  int frame = 0;
+  const auto* begin = text.data();
+  const auto* end = begin + text.size();
+  const auto result = std::from_chars(begin, end, frame);
+  if (result.ec != std::errc{} || result.ptr != end || frame < 0)
+    return std::nullopt;
+
+  return frame;
+}
+
+std::optional<std::string> GetSMGPCSaveStatePath()
+{
+  const char* value = std::getenv("SMGPC_DOLPHIN_SAVE_STATE_PATH");
+  if (value == nullptr || value[0] == '\0')
+    return std::nullopt;
+
+  return std::string(value);
+}
+
+void TrySaveSMGPCState(int current_frame)
+{
+  static const auto target_frame = GetSMGPCSaveStateFrame();
+  static const auto target_path = GetSMGPCSaveStatePath();
+  static std::atomic<bool> completed = false;
+
+  if (!target_frame.has_value() || !target_path.has_value() || current_frame < *target_frame ||
+      completed.exchange(true))
+  {
+    return;
+  }
+
+  Core::QueueHostJob([path = *target_path](Core::System& system) { State::SaveAs(system, path); });
+}
+}  // namespace
+
 // Stretches the native/internal analog resolution aspect ratio from ~4:3 to ~16:9
 static float SourceAspectRatioToWidescreen(float source_aspect)
 {
@@ -189,6 +241,7 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
   }
 
   WiimoteEmu::SetScriptedInputFrame(m_frame_count);
+  TrySaveSMGPCState(m_frame_count);
 
   if (m_xfb_entry)
   {
@@ -243,6 +296,7 @@ void Presenter::ImmediateSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_
   };
 
   WiimoteEmu::SetScriptedInputFrame(m_frame_count);
+  TrySaveSMGPCState(m_frame_count);
 
   auto& video_events = GetVideoEvents();
 
