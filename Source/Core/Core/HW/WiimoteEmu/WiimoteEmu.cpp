@@ -314,6 +314,11 @@ Wiimote::Wiimote(const unsigned int index) : m_index(index), m_bt_device_index(i
 
   if (auto scripted_input = CreateScriptedInputOverride(m_index))
     SetInputOverrideFunction(std::move(scripted_input));
+  if (auto scripted_nunchuk_input = CreateScriptedNunchukInputOverride(m_index))
+  {
+    m_attachments->GetAttachmentList()[ExtensionNumber::NUNCHUK]->SetInputOverrideFunction(
+        std::move(scripted_nunchuk_input));
+  }
 
   m_config_changed_callback_id = Config::AddConfigChangedCallback([this] { RefreshConfig(); });
   RefreshConfig();

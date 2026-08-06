@@ -19,6 +19,7 @@
 #include "Common/CommonTypes.h"
 #include "Common/Logging/Log.h"
 
+#include "Core/HW/WiimoteEmu/Extension/Nunchuk.h"
 #include "Core/HW/WiimoteEmu/WiimoteEmu.h"
 #include "InputCommon/ControllerEmu/ControllerEmu.h"
 
@@ -30,6 +31,8 @@ constexpr std::string_view BUTTON_SCRIPT_ENV = "SMGPC_DOLPHIN_WPAD_BUTTON_SCRIPT
 constexpr std::string_view POINTER_SCRIPT_ENV = "SMGPC_DOLPHIN_WPAD_POINTER_SCRIPT";
 constexpr std::string_view POINTER_WIDTH_ENV = "SMGPC_DOLPHIN_WPAD_POINTER_WIDTH";
 constexpr std::string_view POINTER_HEIGHT_ENV = "SMGPC_DOLPHIN_WPAD_POINTER_HEIGHT";
+constexpr std::string_view NUNCHUK_STICK_SCRIPT_ENV = "SMGPC_DOLPHIN_NUNCHUK_STICK_SCRIPT";
+constexpr std::string_view NUNCHUK_BUTTON_SCRIPT_ENV = "SMGPC_DOLPHIN_NUNCHUK_BUTTON_SCRIPT";
 
 constexpr double DEFAULT_POINTER_WIDTH = 640.0;
 constexpr double DEFAULT_POINTER_HEIGHT = 456.0;
@@ -56,12 +59,25 @@ struct PointerSpan
   bool visible = true;
 };
 
+struct StickSpan
+{
+  FrameRange range;
+  ControlState x = 0.0;
+  ControlState y = 0.0;
+};
+
 struct ScriptedInput
 {
   std::vector<ButtonSpan> button_spans;
   std::vector<PointerSpan> pointer_spans;
   double pointer_width = DEFAULT_POINTER_WIDTH;
   double pointer_height = DEFAULT_POINTER_HEIGHT;
+};
+
+struct ScriptedNunchukInput
+{
+  std::vector<ButtonSpan> button_spans;
+  std::vector<StickSpan> stick_spans;
 };
 
 std::string_view Trim(std::string_view text)
@@ -160,6 +176,16 @@ std::optional<u16> ParseButton(std::string_view text)
   return std::nullopt;
 }
 
+std::optional<u16> ParseNunchukButton(std::string_view text)
+{
+  const std::string token = Uppercase(text);
+  if (token == "C")
+    return Nunchuk::BUTTON_C;
+  if (token == "Z")
+    return Nunchuk::BUTTON_Z;
+  return std::nullopt;
+}
+
 std::optional<bool> ParseBool(std::string_view text)
 {
   const std::string value = Uppercase(text);
@@ -175,7 +201,9 @@ bool IsActive(const FrameRange& range, u64 frame)
   return frame >= range.first && frame <= range.last;
 }
 
-void ParseButtonScript(std::string_view text, ScriptedInput* script)
+template <typename ButtonParser>
+void ParseButtonScript(std::string_view text, std::vector<ButtonSpan>* spans,
+                       ButtonParser parse_button, std::string_view controller_name)
 {
   std::size_t invalid_entries = 0;
   while (!text.empty())
@@ -194,7 +222,7 @@ void ParseButtonScript(std::string_view text, ScriptedInput* script)
       while (valid_buttons)
       {
         const std::size_t plus = buttons.find('+');
-        const auto button = ParseButton(buttons.substr(0, plus));
+        const auto button = parse_button(buttons.substr(0, plus));
         if (!button)
         {
           valid_buttons = false;
@@ -207,7 +235,7 @@ void ParseButtonScript(std::string_view text, ScriptedInput* script)
       }
 
       if (range && valid_buttons && mask != 0)
-        script->button_spans.push_back(ButtonSpan{*range, mask});
+        spans->push_back(ButtonSpan{*range, mask});
       else
         ++invalid_entries;
     }
@@ -219,7 +247,52 @@ void ParseButtonScript(std::string_view text, ScriptedInput* script)
 
   if (invalid_entries != 0)
   {
-    WARN_LOG_FMT(WIIMOTE, "Ignored {} malformed frame-scripted Wii Remote button span(s).",
+    WARN_LOG_FMT(WIIMOTE, "Ignored {} malformed frame-scripted {} button span(s).", invalid_entries,
+                 controller_name);
+  }
+}
+
+void ParseStickScript(std::string_view text, ScriptedNunchukInput* script)
+{
+  std::size_t invalid_entries = 0;
+  while (!text.empty())
+  {
+    const std::size_t separator = text.find(';');
+    const std::string_view entry = Trim(text.substr(0, separator));
+    if (!entry.empty())
+    {
+      const std::size_t colon = entry.find(':');
+      const auto range =
+          colon == std::string_view::npos ? std::nullopt : ParseFrameRange(entry.substr(0, colon));
+      const std::string_view values =
+          colon == std::string_view::npos ? std::string_view{} : entry.substr(colon + 1);
+      const std::size_t comma = values.find(',');
+      const auto x = comma == std::string_view::npos ?
+                         std::nullopt :
+                         ParseNumber<ControlState>(values.substr(0, comma));
+      const auto y = comma == std::string_view::npos ?
+                         std::nullopt :
+                         ParseNumber<ControlState>(values.substr(comma + 1));
+
+      if (range && x && y && std::isfinite(*x) && std::isfinite(*y) && *x >= -1.0 && *x <= 1.0 &&
+          *y >= -1.0 && *y <= 1.0)
+      {
+        script->stick_spans.push_back(StickSpan{*range, *x, *y});
+      }
+      else
+      {
+        ++invalid_entries;
+      }
+    }
+
+    if (separator == std::string_view::npos)
+      break;
+    text.remove_prefix(separator + 1);
+  }
+
+  if (invalid_entries != 0)
+  {
+    WARN_LOG_FMT(WIIMOTE, "Ignored {} malformed frame-scripted Nunchuk stick span(s).",
                  invalid_entries);
   }
 }
@@ -314,6 +387,18 @@ std::optional<u16> ButtonMaskForControl(std::string_view group_name, std::string
   }
   return std::nullopt;
 }
+
+std::optional<u16> NunchukButtonMaskForControl(std::string_view group_name,
+                                               std::string_view control_name)
+{
+  if (group_name != Nunchuk::BUTTONS_GROUP)
+    return std::nullopt;
+  if (control_name == Nunchuk::C_BUTTON)
+    return Nunchuk::BUTTON_C;
+  if (control_name == Nunchuk::Z_BUTTON)
+    return Nunchuk::BUTTON_Z;
+  return std::nullopt;
+}
 }  // namespace
 
 ControllerEmu::InputOverrideFunction CreateScriptedInputOverride(unsigned int wiimote_index)
@@ -330,7 +415,9 @@ ControllerEmu::InputOverrideFunction CreateScriptedInputOverride(unsigned int wi
 
   auto script = std::make_shared<ScriptedInput>();
   if (button_text)
-    ParseButtonScript(*button_text, script.get());
+  {
+    ParseButtonScript(*button_text, &script->button_spans, ParseButton, "Wii Remote");
+  }
   if (pointer_text)
     ParsePointerScript(*pointer_text, script.get());
   script->pointer_width = ReadPositiveDimension(POINTER_WIDTH_ENV, DEFAULT_POINTER_WIDTH);
@@ -387,6 +474,70 @@ ControllerEmu::InputOverrideFunction CreateScriptedInputOverride(unsigned int wi
     if (control_name == ControllerEmu::ReshapableInput::X_INPUT_OVERRIDE)
       return std::clamp(2.0 * active_pointer->x / script->pointer_width - 1.0, -1.0, 1.0);
     return std::clamp(1.0 - 2.0 * active_pointer->y / script->pointer_height, -1.0, 1.0);
+  };
+}
+
+ControllerEmu::InputOverrideFunction CreateScriptedNunchukInputOverride(unsigned int wiimote_index)
+{
+  if (wiimote_index != 0)
+    return {};
+
+  const auto stick_text = ReadEnvironment(NUNCHUK_STICK_SCRIPT_ENV);
+  const auto button_text = ReadEnvironment(NUNCHUK_BUTTON_SCRIPT_ENV);
+  if (!stick_text && !button_text)
+    return {};
+
+  auto script = std::make_shared<ScriptedNunchukInput>();
+  if (stick_text)
+    ParseStickScript(*stick_text, script.get());
+  if (button_text)
+  {
+    ParseButtonScript(*button_text, &script->button_spans, ParseNunchukButton, "Nunchuk");
+  }
+
+  if (script->stick_spans.empty() && script->button_spans.empty())
+    return {};
+
+  s_current_frame.store(0, std::memory_order_relaxed);
+
+  INFO_LOG_FMT(WIIMOTE,
+               "Enabled frame-scripted input for Wii Remote 1 Nunchuk ({} stick span(s), {} "
+               "button span(s)).",
+               script->stick_spans.size(), script->button_spans.size());
+
+  return [script = std::move(script)](std::string_view group_name, std::string_view control_name,
+                                      ControlState state) -> std::optional<ControlState> {
+    const u64 frame = s_current_frame.load(std::memory_order_relaxed);
+
+    if (const auto control_mask = NunchukButtonMaskForControl(group_name, control_name))
+    {
+      u16 active_mask = 0;
+      for (const ButtonSpan& span : script->button_spans)
+      {
+        if (IsActive(span.range, frame))
+          active_mask |= span.mask;
+      }
+      return (active_mask & *control_mask) != 0 ? 1.0 : state;
+    }
+
+    if (group_name != Nunchuk::STICK_GROUP ||
+        (control_name != ControllerEmu::ReshapableInput::X_INPUT_OVERRIDE &&
+         control_name != ControllerEmu::ReshapableInput::Y_INPUT_OVERRIDE))
+    {
+      return std::nullopt;
+    }
+
+    const StickSpan* active_stick = nullptr;
+    for (const StickSpan& span : script->stick_spans)
+    {
+      if (IsActive(span.range, frame))
+        active_stick = &span;
+    }
+    if (active_stick == nullptr)
+      return state;
+
+    return control_name == ControllerEmu::ReshapableInput::X_INPUT_OVERRIDE ? active_stick->x :
+                                                                              active_stick->y;
   };
 }
 

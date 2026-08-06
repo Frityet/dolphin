@@ -13,6 +13,11 @@ namespace WiimoteEmu
 // function means that scripted input was not requested for this Wii Remote.
 ControllerEmu::InputOverrideFunction CreateScriptedInputOverride(unsigned int wiimote_index);
 
+// Returns an input override for the Nunchuk attachment driven by optional environment-provided
+// stick and button frame scripts. An empty function means that scripted Nunchuk input was not
+// requested for this Wii Remote.
+ControllerEmu::InputOverrideFunction CreateScriptedNunchukInputOverride(unsigned int wiimote_index);
+
 // Keeps frame scripts on the same unique-presented-frame clock used by frame capture and render
 // traces. This is called from the presenter and is safe to read from the emulation thread.
 void SetScriptedInputFrame(u64 frame);
